@@ -176,6 +176,63 @@ fn recipe_error_maps_reach_classification() {
 }
 
 #[test]
+fn cli_recipe_registry_extends_effective() {
+    // P2 recipe registry: add a registry recipe via the CLI, then verify a
+    // project recipe with `extends` merges it (registry layer + project win).
+    let home = std::env::temp_dir().join(format!("unirun-cli-reg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let prev = std::env::var_os("UNIRUN_HOME");
+    std::env::set_var("UNIRUN_HOME", &home);
+
+    let src = std::env::temp_dir().join(format!("unirun-cli-reg-src-{}", std::process::id()));
+    std::fs::write(
+        &src,
+        "[toolchains.python]\nrunner = \"python3\"\n[toolchains.node]\nrunner = \"pnpm\"\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_unirun"))
+        .args(["recipe", "add", "python-base"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let dir = tmp_dir("reg-ext");
+    write_recipe(
+        &dir,
+        "extends = [\"python-base\"]\n[timeouts]\ndefault_ms = 7777\n",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_unirun"))
+        .args(["recipe", "effective", "--workdir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("runner = \"python3\""), "{}", text);
+    assert!(text.contains("runner = \"pnpm\""), "{}", text);
+    assert!(text.contains("default_ms = 7777"), "{}", text);
+
+    match prev {
+        Some(v) => std::env::set_var("UNIRUN_HOME", v),
+        None => std::env::remove_var("UNIRUN_HOME"),
+    }
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn cli_mcp_stdin_streams_one_line_per_request() {
     // Sanity: `unirun mcp` speaks newline-delimited JSON (already covered in
     // tests/mcp.rs); here we just verify the binary exposes the subcommand.

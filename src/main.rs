@@ -23,7 +23,11 @@ USAGE:
   unirun script <file> [options]        run a script file (shell by extension)
   unirun probe [--json]                 show host capabilities
   unirun mcp                            serve the MCP protocol over stdio
+  unirun acp                            serve the Agent Client Protocol over stdio
   unirun ssh <host> '<script>' [opts]  run a script on a remote Windows host
+  unirun bg <start|status|output|kill|list|wait> ...   background sessions
+  unirun recipe <list|show|add|rm|path|effective|check>   recipe registry
+  unirun winrm <host> '<script>' [opts]  run a script via WinRM (feature: winrm)
   unirun --version | --help
 
 OPTIONS:
@@ -37,6 +41,7 @@ OPTIONS:
 
 Projects may ship a `.unirun/recipe.toml`; run/script auto-apply its
 timeout and output conventions, and `--toolchain` resolves its runners.
+Recipe layers: built-in defaults <- registry (extends) <- project recipe.
 ";
 
 fn main() -> ExitCode {
@@ -62,6 +67,7 @@ fn main() -> ExitCode {
         "script" => cmd_script(&args[1..]),
         "probe" => cmd_probe(&args[1..]),
         "ssh" => cmd_ssh(&args[1..]),
+        "recipe" => cmd_recipe(&args[1..]),
         "mcp" => {
             if let Err(e) = unirun::mcp::serve() {
                 eprintln!("unirun mcp: {}", e);
@@ -343,4 +349,160 @@ fn cmd_probe(args: &[String]) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+const RECIPE_HELP: &str = "\
+unirun recipe — user-level recipe registry
+
+USAGE:
+  unirun recipe list                     list registry recipes
+  unirun recipe show <name> [--raw]      show a registry recipe (effective unless --raw)
+  unirun recipe add <name> <file.toml>   add/overwrite a registry recipe
+  unirun recipe rm <name>                remove a registry recipe
+  unirun recipe path                     print the registry directory
+  unirun recipe effective [--workdir d] [--json]   effective project recipe (extends resolved)
+  unirun recipe check                    validate registry recipes (parse + extends cycles)
+
+The registry lives in $UNIRUN_HOME/recipes (default ~/.unirun/recipes).
+Project recipes opt in via `extends = [\"name\", ...]` (earlier = lower layer).
+";
+
+fn cmd_recipe(args: &[String]) -> ExitCode {
+    use unirun::recipe::{effective_recipe, registry_dir, Recipe, RecipeRegistry};
+    let Some(sub) = args.first().map(|s| s.as_str()) else {
+        eprintln!("{}", RECIPE_HELP);
+        return ExitCode::from(2);
+    };
+    let rest = &args[1..];
+    match sub {
+        "list" => {
+            let entries = RecipeRegistry::list();
+            if entries.is_empty() {
+                println!("(no registry recipes in {})", registry_dir().display());
+            }
+            for (name, path) in entries {
+                println!("{:<20} {}", name, path.display());
+            }
+            ExitCode::SUCCESS
+        }
+        "show" => {
+            let raw = rest.iter().any(|a| a == "--raw");
+            let Some(name) = rest.iter().find(|a| !a.starts_with('-')) else {
+                eprintln!("unirun recipe show: missing recipe name");
+                return ExitCode::from(2);
+            };
+            if raw {
+                let path = registry_dir().join(format!("{}.toml", name));
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        print!("{}", text);
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("unirun recipe show: {}", e);
+                        ExitCode::from(2)
+                    }
+                }
+            } else {
+                match RecipeRegistry::load(name) {
+                    Some(r) => {
+                        let (eff, warnings) =
+                            effective_recipe(&r, &mut |n| RecipeRegistry::load(n));
+                        for w in warnings {
+                            eprintln!("unirun: {}", w);
+                        }
+                        print!("{}", toml::to_string(&eff).unwrap_or_default());
+                        ExitCode::SUCCESS
+                    }
+                    None => {
+                        eprintln!("unirun recipe show: no registry recipe `{}`", name);
+                        ExitCode::from(2)
+                    }
+                }
+            }
+        }
+        "add" => {
+            if rest.len() < 2 {
+                eprintln!("unirun recipe add: usage: unirun recipe add <name> <file.toml>");
+                return ExitCode::from(2);
+            }
+            match RecipeRegistry::add(&rest[0], std::path::Path::new(&rest[1])) {
+                Ok(dest) => {
+                    println!("added {}", dest.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("unirun recipe add: {}", e);
+                    ExitCode::from(2)
+                }
+            }
+        }
+        "rm" | "remove" => {
+            let Some(name) = rest.first() else {
+                eprintln!("unirun recipe rm: missing recipe name");
+                return ExitCode::from(2);
+            };
+            match RecipeRegistry::remove(name) {
+                Ok(()) => {
+                    println!("removed `{}`", name);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("unirun recipe rm: {}", e);
+                    ExitCode::from(2)
+                }
+            }
+        }
+        "path" => {
+            println!("{}", registry_dir().display());
+            ExitCode::SUCCESS
+        }
+        "effective" => {
+            let json = rest.iter().any(|a| a == "--json");
+            let workdir = rest
+                .iter()
+                .position(|a| a == "--workdir")
+                .and_then(|i| rest.get(i + 1))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            match Recipe::load_from_dir(&workdir) {
+                Some(eff) => {
+                    let out = if json {
+                        serde_json::to_string_pretty(&eff).unwrap_or_default()
+                    } else {
+                        toml::to_string(&eff).unwrap_or_default()
+                    };
+                    print!("{}", out);
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    eprintln!(
+                        "unirun recipe effective: no recipe found from {}",
+                        workdir.display()
+                    );
+                    ExitCode::from(2)
+                }
+            }
+        }
+        "check" => match RecipeRegistry::check() {
+            Ok(names) => {
+                println!("recipe registry OK ({} recipe(s))", names.len());
+                for n in names {
+                    println!("  ok: {}", n);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(errors) => {
+                for e in errors {
+                    eprintln!("unirun recipe check: {}", e);
+                }
+                ExitCode::from(1)
+            }
+        },
+        other => {
+            eprintln!("unirun recipe: unknown subcommand `{}`", other);
+            eprintln!("{}", RECIPE_HELP);
+            ExitCode::from(2)
+        }
+    }
 }
