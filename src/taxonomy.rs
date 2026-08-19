@@ -91,9 +91,12 @@ pub fn classify(r: &ExecResult) -> (Option<String>, Option<String>) {
         // class without evidence (fail-closed classification).
         (None, None)
     } else {
+        // Carry a bounded stderr excerpt so agents (and humans) can see what
+        // defeated classification without fetching the full output.
+        let excerpt: String = r.stderr.chars().take(200).collect();
         (
             Some("UNKNOWN_FAILURE".into()),
-            Some("non-zero exit with unrecognized stderr; inspect it above".into()),
+            Some(format!("unrecognized stderr: {}", excerpt)),
         )
     }
 }
