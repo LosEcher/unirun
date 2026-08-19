@@ -1,4 +1,5 @@
-//! SSH remote transport — the win-exec knowledge ported to Rust.
+//! SSH remote transport — the win-exec knowledge ported to Rust, plus a
+//! Unix remote branch.
 //!
 //! Kills the `bash → ssh → cmd.exe → PowerShell` escaping chain the same way
 //! win-exec does: script content travels as a **payload** (UTF-16LE base64
@@ -6,11 +7,16 @@
 //! as a hand-quoted command string. The "golden recipe" is auto-injected so
 //! PowerShell 5.1 emits clean UTF-8 (no CLIXML/OEM/GBK mojibake), and the
 //! `exit $LASTEXITCODE` contract propagates exact remote exit codes.
+//!
+//! Unix remotes (bash / sh / zsh) get the same payload philosophy: the script
+//! travels over stdin to `<shell> -s`, so no outer quoting layer can corrupt
+//! it, and the script's own exit code propagates exactly.
 
 use crate::spec::{ExecResult, Shell};
 use crate::taxonomy::classify;
 use base64::Engine;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,10 +32,17 @@ const MAX_OUTPUT: usize = 256 * 1024;
 #[derive(Debug, Clone)]
 pub struct SshTarget {
     pub host: String,
-    /// Remote shell: `Powershell` (PS 5.1) | `Pwsh` (7) | `Cmd`.
+    /// Remote shell: `Bash` | `Sh` | `Zsh` (Unix) | `Powershell` (PS 5.1) |
+    /// `Pwsh` (7) | `Cmd`.
     pub shell: Shell,
     pub timeout_ms: u64,
     pub connect_timeout: u64,
+    /// Optional SSH user (`user@host`); falls back to the local user / ssh config.
+    pub user: Option<String>,
+    /// Optional SSH port (`-p`); falls back to 22 / ssh config.
+    pub port: Option<u16>,
+    /// Optional identity file (`-i`).
+    pub identity_file: Option<PathBuf>,
 }
 
 impl Default for SshTarget {
@@ -39,26 +52,36 @@ impl Default for SshTarget {
             shell: Shell::Powershell,
             timeout_ms: 120_000,
             connect_timeout: 15,
+            user: None,
+            port: None,
+            identity_file: None,
         }
     }
 }
 
-/// Run a script on a remote Windows host over SSH. Returns a normalized
-/// `ExecResult` with exact remote exit code and clean UTF-8 output.
+/// Run a script on a remote host over SSH. Returns a normalized `ExecResult`
+/// with exact remote exit code and clean UTF-8 output. Windows targets use
+/// the win-exec payload machinery; Unix targets stream the script over stdin.
 pub fn ssh_run(target: &SshTarget, script: &str) -> ExecResult {
     match target.shell {
         Shell::Powershell | Shell::Pwsh => ssh_powershell(target, script),
         Shell::Cmd => ssh_cmd_file(target, script),
-        other => {
-            let mut r = ExecResult::success(String::new(), String::new(), other.as_str());
-            r.error_class = Some("COMMAND_NOT_FOUND".into());
-            r.hint = Some(format!(
-                "shell `{}` is not a Windows remote shell; use powershell / pwsh / cmd",
-                other.as_str()
-            ));
-            r
-        }
+        Shell::Bash | Shell::Sh | Shell::Zsh => ssh_unix(target, script),
     }
+}
+
+/// Unix remote: script travels over stdin to `<shell> -s`, so no outer
+/// quoting layer can corrupt it (same payload philosophy as the Windows
+/// branch, minus the encoding dance — UTF-8 everywhere). The script's own
+/// exit code propagates exactly (`exit N` → rc N), and stderr reaches the
+/// classifier so "command not found" and friends get the stable taxonomy.
+fn ssh_unix(target: &SshTarget, script: &str) -> ExecResult {
+    let shell_bin = match target.shell {
+        Shell::Sh => "sh",
+        Shell::Zsh => "zsh",
+        _ => "bash",
+    };
+    run_ssh(target, &format!("{} -s", shell_bin), Some(script))
 }
 
 fn ssh_powershell(target: &SshTarget, script: &str) -> ExecResult {
@@ -71,7 +94,7 @@ fn ssh_powershell(target: &SshTarget, script: &str) -> ExecResult {
     let b64 = base64_utf16le(&payload);
     if b64.len() <= B64_THRESHOLD {
         let remote_cmd = format!("{} -NoProfile -NonInteractive -EncodedCommand {}", exe, b64);
-        run_ssh(target, &remote_cmd)
+        run_ssh(target, &remote_cmd, None)
     } else {
         // Large payload: scp a UTF-8-BOM temp .ps1, run with -File, clean up.
         let remote_path = format!(r"C:\Windows\Temp\unirun-{}.ps1", nonce());
@@ -88,8 +111,8 @@ fn ssh_powershell(target: &SshTarget, script: &str) -> ExecResult {
             "{} -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {}",
             exe, remote_path
         );
-        let r = run_ssh(target, &remote_cmd);
-        let _ = run_ssh(target, &format!("del /q {}", remote_path));
+        let r = run_ssh(target, &remote_cmd, None);
+        let _ = run_ssh(target, &format!("del /q {}", remote_path), None);
         r
     }
 }
@@ -105,27 +128,25 @@ fn ssh_cmd_file(target: &SshTarget, script: &str) -> ExecResult {
         return r;
     }
     let remote_cmd = format!("cmd.exe /C \"{}\"", remote_path);
-    let r = run_ssh(target, &remote_cmd);
+    let r = run_ssh(target, &remote_cmd, None);
     // Clean the temp file best-effort.
-    let _ = run_ssh(target, &format!("del /q {}", remote_path));
+    let _ = run_ssh(target, &format!("del /q {}", remote_path), None);
     r
 }
 
 /// Spawn ssh, capture output with a deadline, filter the OpenSSH banner.
-fn run_ssh(target: &SshTarget, remote_cmd: &str) -> ExecResult {
+/// `stdin_payload` is streamed to the remote command's stdin (Unix `-s`
+/// shells); `None` closes stdin immediately (Windows branches).
+fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) -> ExecResult {
     let start = Instant::now();
     let mut cmd = Command::new("ssh");
-    cmd.arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg(format!("ConnectTimeout={}", target.connect_timeout))
-        .arg("-o")
-        .arg("ServerAliveInterval=30")
-        .arg(&target.host)
-        .arg(remote_cmd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(ssh_argv(target, remote_cmd));
+    if stdin_payload.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -141,6 +162,17 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str) -> ExecResult {
             return r;
         }
     };
+
+    if let Some(payload) = stdin_payload {
+        let mut stdin = child.stdin.take().unwrap();
+        let payload = payload.to_string();
+        // Write in a thread so a large payload cannot deadlock against the
+        // remote's output readers. Dropping stdin closes it → EOF on the
+        // remote, which ends the `-s` script.
+        thread::spawn(move || {
+            let _ = stdin.write_all(payload.as_bytes());
+        });
+    }
 
     let so = child.stdout.take().unwrap();
     let se = child.stderr.take().unwrap();
@@ -207,6 +239,44 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str) -> ExecResult {
     result
 }
 
+/// Build the `ssh` argv for a target + remote command. Pure and
+/// unit-testable: host/user/port/identity + the strict batch options.
+///
+/// ControlMaster is explicitly disabled: a reused connection lives in a
+/// detached master daemon, so killing this process group could not terminate
+/// the remote command tree — breaking unirun's whole-tree deadline guarantee.
+fn ssh_argv(target: &SshTarget, remote_cmd: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        format!("ConnectTimeout={}", target.connect_timeout),
+        "-o".into(),
+        "ServerAliveInterval=30".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        "ControlMaster=no".into(),
+        "-o".into(),
+        "ControlPath=none".into(),
+    ];
+    if let Some(port) = target.port {
+        args.push("-p".into());
+        args.push(port.to_string());
+    }
+    if let Some(identity) = &target.identity_file {
+        args.push("-i".into());
+        args.push(identity.to_string_lossy().into_owned());
+    }
+    let host = match &target.user {
+        Some(u) if !u.is_empty() => format!("{}@{}", u, target.host),
+        _ => target.host.clone(),
+    };
+    args.push(host);
+    args.push(remote_cmd.to_string());
+    args
+}
+
 /// Upload bytes as a temp file on the remote host via scp.
 fn upload_scp(target: &SshTarget, remote_path: &str, bytes: &[u8]) -> std::io::Result<()> {
     // Local temp file (0600), scp it over, remove locally.
@@ -220,14 +290,30 @@ fn upload_scp(target: &SshTarget, remote_path: &str, bytes: &[u8]) -> std::io::R
         }
         f.write_all(bytes)?;
     }
-    let status = Command::new("scp")
-        .arg("-o")
+    let mut cmd = Command::new("scp");
+    cmd.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg(format!("ConnectTimeout={}", target.connect_timeout))
-        .arg(&local)
-        .arg(format!("{}:{}", target.host, remote_path))
-        .status()?;
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg("-o")
+        .arg("ControlPath=none");
+    // Note: scp uses uppercase `-P` for the port (ssh uses lowercase `-p`).
+    if let Some(port) = target.port {
+        cmd.arg("-P").arg(port.to_string());
+    }
+    if let Some(identity) = &target.identity_file {
+        cmd.arg("-i").arg(identity);
+    }
+    let dest = match &target.user {
+        Some(u) if !u.is_empty() => format!("{}@{}:{}", u, target.host, remote_path),
+        _ => format!("{}:{}", target.host, remote_path),
+    };
+    cmd.arg(&local).arg(dest);
+    let status = cmd.status()?;
     let _ = std::fs::remove_file(&local);
     if status.success() {
         Ok(())
@@ -321,4 +407,88 @@ fn kill_ssh_tree(child: &Child, _grace: Duration) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target() -> SshTarget {
+        SshTarget {
+            host: "h.example".into(),
+            shell: Shell::Bash,
+            timeout_ms: 0,
+            connect_timeout: 15,
+            user: None,
+            port: None,
+            identity_file: None,
+        }
+    }
+
+    #[test]
+    fn argv_defaults_include_batch_and_accept_new() {
+        let a = ssh_argv(&target(), "bash -s");
+        assert!(a.contains(&"-o".to_string()));
+        assert!(a.contains(&"BatchMode=yes".to_string()));
+        assert!(a.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+        assert!(a.contains(&"ControlMaster=no".to_string()));
+        assert!(a.contains(&"ControlPath=none".to_string()));
+        assert!(a.contains(&"ConnectTimeout=15".to_string()));
+        assert!(a.contains(&"h.example".to_string()));
+        assert!(a.contains(&"bash -s".to_string()));
+    }
+
+    #[test]
+    fn argv_user_port_identity() {
+        let mut t = target();
+        t.user = Some("root".into());
+        t.port = Some(2222);
+        t.identity_file = Some(PathBuf::from("/tmp/key"));
+        let a = ssh_argv(&t, "bash -s");
+        assert!(a.contains(&"root@h.example".to_string()));
+        let p = a.iter().position(|v| v == "-p").unwrap();
+        assert_eq!(a[p + 1], "2222");
+        let i = a.iter().position(|v| v == "-i").unwrap();
+        assert_eq!(a[i + 1], "/tmp/key");
+        assert!(
+            !a.contains(&"h.example".to_string()),
+            "bare host must not appear when user set"
+        );
+    }
+
+    #[test]
+    fn argv_empty_user_falls_back_to_bare_host() {
+        let mut t = target();
+        t.user = Some(String::new());
+        let a = ssh_argv(&t, "bash -s");
+        assert!(a.contains(&"h.example".to_string()));
+        assert!(!a.contains(&"@h.example".to_string()));
+    }
+
+    #[test]
+    fn unix_shells_dispatch_to_unix_path() {
+        for s in [Shell::Bash, Shell::Sh, Shell::Zsh] {
+            let mut t = target();
+            t.shell = s;
+            t.host = "127.0.0.1".into();
+            t.connect_timeout = 1;
+            let r = ssh_run(&t, "echo hi");
+            // Must NOT be the old "not a Windows remote shell" rejection;
+            // any other outcome (connection refused etc.) is a transport fact.
+            assert_ne!(
+                r.error_class.as_deref(),
+                Some("COMMAND_NOT_FOUND"),
+                "shell {} must not be rejected",
+                s.as_str()
+            );
+            assert!(
+                !r.hint
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("not a Windows remote shell"),
+                "hint must not mention Windows for unix shell {}",
+                s.as_str()
+            );
+        }
+    }
 }

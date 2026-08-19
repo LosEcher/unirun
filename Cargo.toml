@@ -1,6 +1,6 @@
 [package]
 name = "unirun"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Cross-platform command execution normalization for AI agents — one command spec in, one normalized result out, on any platform."
 license = "MIT"

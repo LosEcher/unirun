@@ -24,7 +24,7 @@ USAGE:
   unirun probe [--json]                 show host capabilities
   unirun mcp                            serve the MCP protocol over stdio
   unirun acp                            serve the Agent Client Protocol over stdio
-  unirun ssh <host> '<script>' [opts]  run a script on a remote Windows host
+  unirun ssh <host> '<script>' [opts]  run a script on a remote host (Unix or Windows)
   unirun bg <start|status|output|kill|list|wait> ...   background sessions
   unirun recipe <list|show|add|rm|path|effective|check>   recipe registry
   unirun winrm <host> '<script>' [opts]  run a script via WinRM (feature: winrm)
@@ -36,6 +36,9 @@ OPTIONS:
   --workdir <dir>    working directory
   --env K=V          environment override (repeatable)
   --toolchain <name> run via a recipe toolchain runner (e.g. python -> uv run)
+  --user <name>      SSH user for `unirun ssh` (user@host)
+  --port <n>         SSH port for `unirun ssh` (default 22 / ssh config)
+  --identity <file>  SSH identity file for `unirun ssh` (-i)
   --json             emit the normalized result as JSON (agent mode)
   --pretty           pretty-print JSON (implies --json)
 
@@ -110,6 +113,10 @@ struct CliOpts {
     tail_bytes: Option<usize>,
     json: bool,
     pretty: bool,
+    /// SSH-only: `unirun ssh` identity options.
+    user: Option<String>,
+    port: Option<u16>,
+    identity: Option<PathBuf>,
 }
 
 /// Parse `--flag value` pairs; positional args are returned in order.
@@ -153,6 +160,21 @@ fn parse_flags(args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, Strin
                 i += 1;
                 let v = args.get(i).ok_or("--toolchain needs a value")?;
                 opts.toolchain = Some(v.clone());
+            }
+            "--user" => {
+                i += 1;
+                let v = args.get(i).ok_or("--user needs a value")?;
+                opts.user = Some(v.clone());
+            }
+            "--port" => {
+                i += 1;
+                let v = args.get(i).ok_or("--port needs a value")?;
+                opts.port = Some(v.parse().map_err(|_| "invalid --port (integer)")?);
+            }
+            "--identity" | "--identity-file" => {
+                i += 1;
+                let v = args.get(i).ok_or("--identity needs a path")?;
+                opts.identity = Some(PathBuf::from(v));
             }
             "--label" => {
                 i += 1;
@@ -330,11 +352,20 @@ fn cmd_ssh(args: &[String]) -> ExitCode {
         }
     };
     if positional.len() < 2 {
-        eprintln!("unirun ssh: usage: unirun ssh <host> '<script>' [--shell powershell|pwsh|cmd] [--timeout N]");
+        eprintln!("unirun ssh: usage: unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--timeout N]");
+        return ExitCode::from(2);
+    }
+    // Remote cwd/env are not yet supported — refuse loudly instead of
+    // silently ignoring them.
+    if opts.workdir.is_some() || !opts.env.is_empty() {
+        eprintln!("unirun ssh: --workdir/--env are not supported for remote execution (yet)");
         return ExitCode::from(2);
     }
     let mut target = unirun::SshTarget {
         host: positional[0].clone(),
+        user: opts.user.clone(),
+        port: opts.port,
+        identity_file: opts.identity.clone(),
         ..Default::default()
     };
     if let Some(s) = opts.shell {

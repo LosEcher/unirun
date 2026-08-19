@@ -100,7 +100,7 @@ unirun script path/to/script [options]     # shell inferred from extension
 unirun probe [--json]                      # host capability snapshot
 unirun mcp                                 # serve MCP over stdio (agents)
 unirun acp                                 # serve Agent Client Protocol v1 over stdio
-unirun ssh <host> '<script>' [--shell powershell|pwsh|cmd]   # remote Windows (SSH)
+unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE]   # remote SSH
 unirun winrm <host> '<script>' [opts]      # remote Windows (WinRM; feature: winrm)
 unirun bg <start|status|output|kill|wait|list> ...   # background sessions
 unirun recipe <list|show|add|rm|path|effective|check> # recipe registry
@@ -154,13 +154,33 @@ survive the launching CLI, and stream decoded output to `stdout.log` /
 as MCP `session.*` tools. Exit-code contract for `bg wait` mirrors the CLI:
 completed rc mirrors the child, timed out 124, aborted/killed 130.
 
-### Remote Windows execution
+### Remote execution (SSH)
 
-**SSH** (`unirun ssh`) is the win-exec knowledge ported to Rust: UTF-16LE
+**SSH** (`unirun ssh`) runs a script on a remote host with the same
+normalization guarantees as local execution — exact exit-code propagation,
+in-process deadline with whole-tree kill, encoding pipeline, stable error
+taxonomy — and the same payload philosophy (no hand-quoted command strings).
+
+Windows targets get the win-exec knowledge ported to Rust: UTF-16LE
 `-EncodedCommand` payloads, auto-injected UTF-8 "golden recipe" (no
 CLIXML/GBK mojibake), exact exit-code propagation via `exit $LASTEXITCODE`,
 and automatic scp + `-File` fallback for large scripts (UTF-8 BOM so Chinese
 content works). cmd.exe targets run via temp `.bat` files.
+
+Unix targets (bash / sh / zsh) stream the script over stdin to `<shell> -s`,
+so no outer quoting layer can corrupt it; the script's own exit code
+propagates exactly.
+
+```bash
+unirun ssh linux-host 'echo 中文OK; exit 42' --shell bash --json
+unirun ssh win-srv 'Write-Output hi' --shell powershell --user admin --port 22 --identity ~/.ssh/id_ed25519
+```
+
+Identity options: `--user U` (user@host), `--port N`, `--identity FILE`
+(-i). Connections are made with `BatchMode=yes`,
+`StrictHostKeyChecking=accept-new`, and `ControlMaster=no` — a reused
+connection lives in a detached master daemon, which would break the
+whole-tree deadline guarantee.
 
 **WinRM** (`unirun winrm`, build with `--features winrm`) is a POC over
 [psrp-rs](https://crates.io/crates/psrp-rs) (PowerShell Remoting Protocol on
@@ -290,7 +310,10 @@ spawn itself.
   `unirun recipe`), background sessions (`unirun bg` + MCP `session.*`),
   ACP v1 server (`unirun acp`), WinRM provider (psrp-rs POC, `winrm`
   feature), performance benchmarks.
-- **P3 (backlog)** — Windows local execution polish, session resume/replay,
+- **P3 (released)** — Unix SSH remotes (`--shell bash|sh|zsh`, stdin
+  payload), SSH identity options (`--user/--port/--identity`),
+  ControlMaster-disabled whole-tree deadline, Unix SSH integration tests.
+- **P4 (backlog)** — Windows local execution polish, session resume/replay,
   per-stream caps, recipe schema registry (semver'd), transport plugins.
 
 Independent by design: MCP + CLI only, no harness dependency, no telemetry,
