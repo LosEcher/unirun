@@ -310,7 +310,7 @@ fn kill_ssh_tree(child: &mut Child, grace: Duration) {
 }
 
 #[cfg(windows)]
-fn kill_ssh_tree(child: &mut Child, _grace: Duration) {
+fn kill_ssh_tree(child: &Child, _grace: Duration) {
     let _ = Command::new("taskkill")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .status();
