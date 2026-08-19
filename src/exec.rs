@@ -74,7 +74,9 @@ pub fn run_streaming(spec: &ExecSpec, tx: mpsc::Sender<StreamChunk>) -> ExecResu
 }
 
 /// Streaming variant with a caller-owned abort flag (per-session cancel,
-/// e.g. ACP `session/cancel`).
+/// e.g. ACP `session/cancel`). Consumed by the ACP server (P2.5) and by
+/// unit tests.
+#[allow(dead_code)]
 pub(crate) fn run_with_abort_streaming(
     spec: &ExecSpec,
     abort: &AtomicBool,
