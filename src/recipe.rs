@@ -241,12 +241,18 @@ impl RecipeRegistry {
     }
 }
 
-/// Directory holding the registry recipes (test override: `UNIRUN_HOME`).
-pub fn registry_dir() -> PathBuf {
+/// The unirun user home: `$UNIRUN_HOME` or `~/.unirun` (test override via
+/// the environment). Shared by the recipe registry and session storage.
+pub(crate) fn unirun_home() -> PathBuf {
     if let Some(h) = std::env::var_os("UNIRUN_HOME") {
-        return PathBuf::from(h).join("recipes");
+        return PathBuf::from(h);
     }
-    home_dir().join(".unirun").join("recipes")
+    home_dir().join(".unirun")
+}
+
+/// Directory holding the registry recipes.
+pub fn registry_dir() -> PathBuf {
+    unirun_home().join("recipes")
 }
 
 fn home_dir() -> PathBuf {

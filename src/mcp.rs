@@ -42,7 +42,17 @@ pub fn serve() -> std::io::Result<()> {
                 respond(&mut stdout, id, Ok(json!({})))?;
             }
             Some("tools/list") => {
-                let tools = json!([exec_run_tool(), exec_script_tool(), exec_probe_tool()]);
+                let tools = json!([
+                    exec_run_tool(),
+                    exec_script_tool(),
+                    exec_probe_tool(),
+                    session_start_tool(),
+                    session_status_tool(),
+                    session_output_tool(),
+                    session_kill_tool(),
+                    session_list_tool(),
+                    session_wait_tool()
+                ]);
                 respond(&mut stdout, id, Ok(json!({ "tools": tools })))?;
             }
             Some("tools/call") => {
@@ -149,6 +159,70 @@ fn exec_probe_tool() -> Value {
     tool_schema("exec.probe", "Return host capabilities: platform, shells, coreutils (e.g. GNU timeout availability), tools.", json!({}), &[])
 }
 
+fn session_start_tool() -> Value {
+    let mut props = common_properties();
+    props["command"] =
+        json!({ "type": "string", "description": "command line to run in the background" });
+    props["label"] = json!({ "type": "string", "description": "human-readable session label" });
+    tool_schema(
+        "session.start",
+        "Start a command as a detached background session; returns the session record (status running). Poll with session.status/session.wait.",
+        props,
+        &["command"],
+    )
+}
+
+fn session_status_tool() -> Value {
+    tool_schema(
+        "session.status",
+        "Return the current state of a background session (running/completed/timed_out/aborted/failed/killed/interrupted).",
+        json!({ "id": { "type": "string", "description": "session id from session.start" } }),
+        &["id"],
+    )
+}
+
+fn session_output_tool() -> Value {
+    tool_schema(
+        "session.output",
+        "Return the stdout/stderr log tails of a background session.",
+        json!({
+            "id": { "type": "string", "description": "session id from session.start" },
+            "tail": { "type": "number", "description": "max bytes per stream to return (default 65536)" }
+        }),
+        &["id"],
+    )
+}
+
+fn session_kill_tool() -> Value {
+    tool_schema(
+        "session.kill",
+        "Terminate a running background session (aborts the whole process tree).",
+        json!({ "id": { "type": "string", "description": "session id from session.start" } }),
+        &["id"],
+    )
+}
+
+fn session_list_tool() -> Value {
+    tool_schema(
+        "session.list",
+        "List all background sessions, newest first (terminal + running).",
+        json!({}),
+        &[],
+    )
+}
+
+fn session_wait_tool() -> Value {
+    tool_schema(
+        "session.wait",
+        "Block until a background session reaches a terminal state or the timeout elapses; returns the session record.",
+        json!({
+            "id": { "type": "string", "description": "session id from session.start" },
+            "timeout": { "type": "number", "description": "max wait in seconds (default 120)" }
+        }),
+        &["id"],
+    )
+}
+
 fn call_tool(name: &str, args: &Value) -> (String, bool) {
     let result = match name {
         "exec.run" => {
@@ -191,6 +265,105 @@ fn call_tool(name: &str, args: &Value) -> (String, bool) {
             let caps = probe::probe();
             (
                 serde_json::to_string(&caps).unwrap_or_else(|_| "{}".into()),
+                false,
+            )
+        }
+        "session.start" => {
+            let command = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if command.is_empty() {
+                return (
+                    json_error("session.start: missing required argument `command`"),
+                    true,
+                );
+            }
+            let label = args
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("mcp-session")
+                .to_string();
+            let spec = ExecSpec {
+                command,
+                kind: ExecKind::Run,
+                ..spec_from_args(args)
+            };
+            match crate::session::start(&spec, &label) {
+                Ok(st) => (
+                    serde_json::to_string(&st).unwrap_or_else(|_| "{}".into()),
+                    false,
+                ),
+                Err(e) => (json_error(&e), true),
+            }
+        }
+        "session.status" | "session.kill" | "session.wait" => {
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                return (
+                    json_error(&format!("{}: missing required argument `id`", name)),
+                    true,
+                );
+            }
+            let result = match name {
+                "session.status" => crate::session::status(&id),
+                "session.kill" => crate::session::kill(&id),
+                _ => {
+                    let timeout_ms = args
+                        .get("timeout")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(120.0)
+                        * 1000.0;
+                    crate::session::wait(&id, timeout_ms as u64)
+                }
+            };
+            match result {
+                Ok(st) => (
+                    serde_json::to_string(&st).unwrap_or_else(|_| "{}".into()),
+                    false,
+                ),
+                Err(e) => (json_error(&e), true),
+            }
+        }
+        "session.output" => {
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                return (
+                    json_error("session.output: missing required argument `id`"),
+                    true,
+                );
+            }
+            let tail = args
+                .get("tail")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(65_536.0) as usize;
+            match crate::session::output(&id, tail) {
+                Ok((so, se, truncated_log)) => (
+                    serde_json::to_string(&json!({
+                        "id": id,
+                        "stdout": so,
+                        "stderr": se,
+                        "truncated_log": truncated_log,
+                    }))
+                    .unwrap_or_else(|_| "{}".into()),
+                    false,
+                ),
+                Err(e) => (json_error(&e), true),
+            }
+        }
+        "session.list" => {
+            let all = crate::session::list();
+            (
+                serde_json::to_string(&all).unwrap_or_else(|_| "[]".into()),
                 false,
             )
         }

@@ -209,3 +209,81 @@ fn mcp_unknown_method_errors() {
     assert_eq!(v["error"]["code"], serde_json::json!(-32601));
     s.close();
 }
+
+#[test]
+fn mcp_session_start_wait_output() {
+    // Background sessions need an isolated UNIRUN_HOME + the real binary for
+    // the detached runner; other tests here don't depend on these vars.
+    let home = std::env::temp_dir().join(format!("unirun-mcp-sess-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let prev = std::env::var_os("UNIRUN_HOME");
+    std::env::set_var("UNIRUN_HOME", &home);
+    std::env::set_var("UNIRUN_BIN", env!("CARGO_BIN_EXE_unirun"));
+
+    let mut s = McpSession::start();
+    s.request_ok("initialize", serde_json::json!({}));
+    let tools = s.request_ok("tools/list", serde_json::json!({}));
+    let names: Vec<&str> = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"session.start"));
+    assert!(names.contains(&"session.list"));
+
+    let result = s.request_ok(
+        "tools/call",
+        serde_json::json!({
+            "name": "session.start",
+            "arguments": { "command": "echo mcp-bg", "label": "mcp-test" }
+        }),
+    );
+    let st: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    let id = st["id"].as_str().unwrap().to_string();
+    assert_eq!(st["status"], "running");
+
+    let result = s.request_ok(
+        "tools/call",
+        serde_json::json!({
+            "name": "session.wait",
+            "arguments": { "id": id, "timeout": 15 }
+        }),
+    );
+    let st: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(st["status"], "completed", "{}", st);
+
+    let result = s.request_ok(
+        "tools/call",
+        serde_json::json!({
+            "name": "session.output",
+            "arguments": { "id": id }
+        }),
+    );
+    let out: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(
+        out["stdout"].as_str().unwrap().contains("mcp-bg"),
+        "{}",
+        out
+    );
+
+    let result = s.request_ok(
+        "tools/call",
+        serde_json::json!({ "name": "session.list", "arguments": {} }),
+    );
+    let all: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(all.as_array().unwrap().iter().any(|x| x["id"] == id));
+
+    s.close();
+    match prev {
+        Some(v) => std::env::set_var("UNIRUN_HOME", v),
+        None => std::env::remove_var("UNIRUN_HOME"),
+    }
+    std::env::remove_var("UNIRUN_BIN");
+    let _ = std::fs::remove_dir_all(&home);
+}

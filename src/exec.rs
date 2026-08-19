@@ -44,6 +44,12 @@ pub fn reset_abort() {
     ABORT.store(false, Ordering::SeqCst);
 }
 
+/// Set the abort flag programmatically (used by signal handlers in other
+/// processes — e.g. the background-session runner treats SIGTERM as abort).
+pub fn signal_abort() {
+    ABORT.store(true, Ordering::SeqCst);
+}
+
 /// Which stream a chunk came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {

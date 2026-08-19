@@ -10,6 +10,7 @@ pub mod exec;
 pub mod mcp;
 pub mod probe;
 pub mod recipe;
+pub mod session;
 pub mod spec;
 pub mod taxonomy;
 pub mod transport;

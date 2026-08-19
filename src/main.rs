@@ -68,6 +68,14 @@ fn main() -> ExitCode {
         "probe" => cmd_probe(&args[1..]),
         "ssh" => cmd_ssh(&args[1..]),
         "recipe" => cmd_recipe(&args[1..]),
+        "bg" => cmd_bg(&args[1..]),
+        "__bg-runner" => {
+            let Some(dir) = args.get(1).map(PathBuf::from) else {
+                eprintln!("unirun __bg-runner: missing session dir");
+                return ExitCode::from(2);
+            };
+            ExitCode::from(unirun::session::run_runner(&dir).min(255) as u8)
+        }
         "mcp" => {
             if let Err(e) = unirun::mcp::serve() {
                 eprintln!("unirun mcp: {}", e);
@@ -90,6 +98,8 @@ struct CliOpts {
     workdir: Option<PathBuf>,
     env: Vec<(String, String)>,
     toolchain: Option<String>,
+    label: Option<String>,
+    tail_bytes: Option<usize>,
     json: bool,
     pretty: bool,
 }
@@ -135,6 +145,16 @@ fn parse_flags(args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, Strin
                 i += 1;
                 let v = args.get(i).ok_or("--toolchain needs a value")?;
                 opts.toolchain = Some(v.clone());
+            }
+            "--label" => {
+                i += 1;
+                let v = args.get(i).ok_or("--label needs a value")?;
+                opts.label = Some(v.clone());
+            }
+            "--tail" => {
+                i += 1;
+                let v = args.get(i).ok_or("--tail needs a value")?;
+                opts.tail_bytes = Some(v.parse().map_err(|_| "invalid --tail (byte count)")?);
             }
             _ => positional.push(a.clone()),
         }
@@ -505,4 +525,230 @@ fn cmd_recipe(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+const BG_HELP: &str = "\
+unirun bg — background sessions (detached execution agents can poll)
+
+USAGE:
+  unirun bg start '<command>' [--shell s] [--workdir d] [--env K=V] [--timeout N] [--label L] [--json]
+  unirun bg status <id> [--json]
+  unirun bg output <id> [--tail N] [--json]
+  unirun bg kill <id> [--json]
+  unirun bg wait <id> [--timeout N] [--json]
+  unirun bg list [--json]
+
+Sessions live in $UNIRUN_HOME/sessions (default ~/.unirun/sessions).
+Exit-code contract (non-JSON): completed rc mirrors the child; timed out 124;
+aborted/killed 130; other terminal states 1.
+";
+
+fn cmd_bg(args: &[String]) -> ExitCode {
+    use unirun::session as sess;
+    let Some(sub) = args.first().map(|s| s.as_str()) else {
+        eprintln!("{}", BG_HELP);
+        return ExitCode::from(2);
+    };
+    let rest = &args[1..];
+    match sub {
+        "start" => {
+            let mut opts = CliOpts::default();
+            let positional = match parse_flags(rest, &mut opts) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("unirun bg start: {}", e);
+                    return ExitCode::from(2);
+                }
+            };
+            if positional.is_empty() {
+                eprintln!("unirun bg start: missing command");
+                return ExitCode::from(2);
+            }
+            let command = positional.join(" ");
+            let label = opts
+                .label
+                .clone()
+                .unwrap_or_else(|| truncate_label(&command));
+            let spec = unirun::spec::ExecSpec {
+                command,
+                shell: opts.shell,
+                workdir: opts.workdir.clone(),
+                env: opts.env.clone(),
+                timeout_ms: opts.timeout_sec.map(|s| s * 1000).unwrap_or(0),
+                ..Default::default()
+            };
+            match sess::start(&spec, &label) {
+                Ok(st) => {
+                    if opts.json {
+                        println!("{}", serde_json::to_string(&st).unwrap_or_default());
+                    } else {
+                        println!(
+                            "session {} started (pid {}) — {}",
+                            st.id,
+                            st.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                            label
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("unirun bg start: {}", e);
+                    ExitCode::from(1)
+                }
+            }
+        }
+        "status" | "output" | "kill" | "wait" | "list" => {
+            let mut opts = CliOpts::default();
+            let positional = match parse_flags(rest, &mut opts) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("unirun bg {}: {}", sub, e);
+                    return ExitCode::from(2);
+                }
+            };
+            let id = positional.first().map(|s| s.as_str());
+            match sub {
+                "status" => match id {
+                    Some(id) => match sess::status(id) {
+                        Ok(st) => emit_state(&st, opts.json),
+                        Err(e) => {
+                            eprintln!("unirun bg status: {}", e);
+                            ExitCode::from(2)
+                        }
+                    },
+                    None => {
+                        eprintln!("unirun bg status: missing session id");
+                        ExitCode::from(2)
+                    }
+                },
+                "output" => match id {
+                    Some(id) => {
+                        let tail = opts.tail_bytes.unwrap_or(65_536);
+                        match sess::output(id, tail) {
+                            Ok((so, se, truncated_log)) => {
+                                if opts.json {
+                                    println!(
+                                        "{}",
+                                        serde_json::json!({
+                                            "id": id,
+                                            "stdout": so,
+                                            "stderr": se,
+                                            "truncated_log": truncated_log,
+                                        })
+                                    );
+                                } else {
+                                    print!("{}", so);
+                                    if !se.is_empty() {
+                                        println!("--- stderr ---");
+                                        print!("{}", se);
+                                    }
+                                    if truncated_log {
+                                        eprintln!("(log truncated at {} bytes)", tail);
+                                    }
+                                }
+                                ExitCode::SUCCESS
+                            }
+                            Err(e) => {
+                                eprintln!("unirun bg output: {}", e);
+                                ExitCode::from(2)
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!("unirun bg output: missing session id");
+                        ExitCode::from(2)
+                    }
+                },
+                "kill" => match id {
+                    Some(id) => match sess::kill(id) {
+                        Ok(st) => emit_state(&st, opts.json),
+                        Err(e) => {
+                            eprintln!("unirun bg kill: {}", e);
+                            ExitCode::from(2)
+                        }
+                    },
+                    None => {
+                        eprintln!("unirun bg kill: missing session id");
+                        ExitCode::from(2)
+                    }
+                },
+                "wait" => match id {
+                    Some(id) => {
+                        let timeout_ms = opts.timeout_sec.map(|s| s * 1000).unwrap_or(120_000);
+                        match sess::wait(id, timeout_ms) {
+                            Ok(st) => emit_state(&st, opts.json),
+                            Err(e) => {
+                                eprintln!("unirun bg wait: {}", e);
+                                ExitCode::from(2)
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!("unirun bg wait: missing session id");
+                        ExitCode::from(2)
+                    }
+                },
+                "list" => {
+                    let all = sess::list();
+                    if opts.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&all).unwrap_or_else(|_| "[]".into())
+                        );
+                    } else if all.is_empty() {
+                        println!("(no sessions in {})", sess::sessions_dir().display());
+                    } else {
+                        for st in &all {
+                            println!(
+                                "{:<24} {:<11} exit={:<5} {}",
+                                st.id,
+                                st.status,
+                                st.exit_code
+                                    .map(|c| c.to_string())
+                                    .unwrap_or_else(|| "-".into()),
+                                st.label
+                            );
+                        }
+                    }
+                    ExitCode::SUCCESS
+                }
+                _ => unreachable!(),
+            }
+        }
+        other => {
+            eprintln!("unirun bg: unknown subcommand `{}`", other);
+            eprintln!("{}", BG_HELP);
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn emit_state(st: &unirun::session::SessionState, json: bool) -> ExitCode {
+    if json {
+        println!("{}", serde_json::to_string(st).unwrap_or_default());
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "session {} — {} (exit {:?}, class {:?}) — {}",
+        st.id, st.status, st.exit_code, st.error_class, st.label
+    );
+    match st.status.as_str() {
+        "completed" => match st.exit_code {
+            Some(0) => ExitCode::SUCCESS,
+            Some(rc) => ExitCode::from(rc.min(255) as u8),
+            None => ExitCode::from(1),
+        },
+        "timed_out" => ExitCode::from(124),
+        "aborted" | "killed" => ExitCode::from(130),
+        _ => ExitCode::from(1),
+    }
+}
+
+fn truncate_label(command: &str) -> String {
+    let flat: String = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut s: String = flat.chars().take(60).collect();
+    if flat.chars().count() > 60 {
+        s.push('…');
+    }
+    s
 }
