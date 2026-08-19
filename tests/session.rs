@@ -25,43 +25,61 @@ fn with_home(tag: &str, f: impl FnOnce(&std::path::Path)) {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A command emitting output on both streams, valid in the platform's
+/// default shell (bash on POSIX, PowerShell on Windows).
+fn output_cmd() -> &'static str {
+    if cfg!(windows) {
+        "Write-Output 'one'; Write-Output 'two'; Write-Error 'warn'; exit 0"
+    } else {
+        "printf 'one\\n'; printf 'two' ; echo warn >&2"
+    }
+}
+
+/// A long-running command valid in the platform's default shell.
+fn long_cmd() -> &'static str {
+    if cfg!(windows) {
+        "Start-Sleep -Seconds 60"
+    } else {
+        "sleep 60"
+    }
+}
+
 #[test]
 fn library_start_wait_output_roundtrip() {
     with_home("lib", |_| {
         let spec = unirun::spec::ExecSpec {
-            command: "printf 'one\\n'; printf 'two' ; echo warn >&2".into(),
+            command: output_cmd().into(),
             ..Default::default()
         };
         let st = unirun::session::start(&spec, "lib-test").expect("start");
         assert_eq!(st.status, "running");
         let id = st.id.clone();
         let done = unirun::session::wait(&id, 15_000).expect("wait");
-        assert_eq!(done.status, "completed");
-        assert_eq!(done.exit_code, Some(0));
+        assert_eq!(done.status, "completed", "state: {:?}", done);
+        assert_eq!(done.exit_code, Some(0), "state: {:?}", done);
         assert!(done.duration_ms > 0);
         let (so, se, _) = unirun::session::output(&id, 4096).expect("output");
-        assert_eq!(so, "one\ntwo");
-        assert!(se.contains("warn"));
+        assert!(so.contains("one") && so.contains("two"), "stdout: {:?}", so);
+        assert!(se.to_lowercase().contains("warn"), "stderr: {:?}", se);
     });
 }
 
 #[test]
 fn library_kill_terminates_long_run() {
     with_home("kill", |_| {
-        let cmd = if cfg!(windows) {
-            "ping -n 60 127.0.0.1 >nul"
-        } else {
-            "sleep 60"
-        };
         let spec = unirun::spec::ExecSpec {
-            command: cmd.into(),
+            command: long_cmd().into(),
             ..Default::default()
         };
         let st = unirun::session::start(&spec, "kill-test").expect("start");
         let id = st.id.clone();
         std::thread::sleep(Duration::from_millis(400));
+        // The session must still be running when we kill it (guards against
+        // trivially passing on an instantly-failed command).
+        let pre = unirun::session::status(&id).expect("status");
+        assert_eq!(pre.status, "running", "state: {:?}", pre);
         let killed = unirun::session::kill(&id).expect("kill");
-        assert!(killed.is_terminal());
+        assert!(killed.is_terminal(), "state: {:?}", killed);
         let after = unirun::session::status(&id).expect("status");
         assert!(after.is_terminal());
     });
@@ -70,20 +88,15 @@ fn library_kill_terminates_long_run() {
 #[test]
 fn library_timeout_marks_session_timed_out() {
     with_home("to", |_| {
-        let cmd = if cfg!(windows) {
-            "ping -n 60 127.0.0.1 >nul"
-        } else {
-            "sleep 60"
-        };
         let spec = unirun::spec::ExecSpec {
-            command: cmd.into(),
+            command: long_cmd().into(),
             timeout_ms: 500,
             ..Default::default()
         };
         let st = unirun::session::start(&spec, "to-test").expect("start");
         let id = st.id.clone();
         let done = unirun::session::wait(&id, 15_000).expect("wait");
-        assert_eq!(done.status, "timed_out");
+        assert_eq!(done.status, "timed_out", "state: {:?}", done);
     });
 }
 
