@@ -134,12 +134,17 @@ mod tests {
         let caps = probe();
         assert!(caps.platform == "macos" || caps.platform == "linux" || caps.platform == "windows");
         assert!(!caps.shells.is_empty());
-        // On every supported host at least one of bash/sh must exist.
-        let has_posix = caps
-            .shells
-            .iter()
-            .any(|s| (s.name == "bash" || s.name == "sh") && s.path.is_some());
-        assert!(has_posix);
+        // Every supported host must expose at least one native shell.
+        let has_native = if cfg!(windows) {
+            caps.shells.iter().any(|s| {
+                (s.name == "cmd" || s.name == "powershell" || s.name == "pwsh") && s.path.is_some()
+            })
+        } else {
+            caps.shells
+                .iter()
+                .any(|s| (s.name == "bash" || s.name == "sh") && s.path.is_some())
+        };
+        assert!(has_native, "no native shell found: {:?}", caps.shells);
     }
 
     #[test]
