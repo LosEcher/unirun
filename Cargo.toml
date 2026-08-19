@@ -1,0 +1,18 @@
+[package]
+name = "unirun"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform command execution normalization for AI agents — one command spec in, one normalized result out, on any platform."
+license = "MIT"
+repository = "https://github.com/LosEcher/unirun"
+keywords = ["exec", "cross-platform", "agent", "mcp", "shell", "normalization"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[[bin]]
+name = "unirun"
+path = "src/main.rs"
