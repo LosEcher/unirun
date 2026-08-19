@@ -273,6 +273,10 @@ fn acp_multi_block_prompt_joins_lines() {
     let (resp, notifications) = s.wait_response(id);
     assert_eq!(resp["result"]["stopReason"], "end_turn");
     let text = collect_text(&notifications);
-    assert!(text.contains("line-one") && text.contains("line-two"), "{}", text);
+    assert!(
+        text.contains("line-one") && text.contains("line-two"),
+        "{}",
+        text
+    );
     s.close();
 }

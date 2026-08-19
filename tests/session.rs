@@ -104,7 +104,11 @@ fn cli_bg_start_status_list() {
             String::from_utf8_lossy(&out.stderr)
         );
         let text = String::from_utf8_lossy(&out.stdout);
-        assert!(text.contains("session ") && text.contains("cli-test"), "{}", text);
+        assert!(
+            text.contains("session ") && text.contains("cli-test"),
+            "{}",
+            text
+        );
         // Extract the id (first hex token after "session ").
         let id = text
             .split_whitespace()

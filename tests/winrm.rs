@@ -32,7 +32,11 @@ fn winrm_unicode_and_exact_exit_code() {
     let r = winrm_run(&t, "Write-Output '远程OK'\ncmd /c exit 42");
     assert_eq!(r.exit_code, Some(42), "stderr: {}", r.stderr);
     assert!(r.stdout.contains("远程OK"), "stdout: {}", r.stdout);
-    assert!(!r.stdout.contains("CLIXML"), "CLIXML pollution: {}", r.stdout);
+    assert!(
+        !r.stdout.contains("CLIXML"),
+        "CLIXML pollution: {}",
+        r.stdout
+    );
 }
 
 #[test]

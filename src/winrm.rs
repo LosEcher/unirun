@@ -128,9 +128,17 @@ pub fn winrm_run(target: &WinrmTarget, script: &str) -> ExecResult {
             }
             let stdout = join_lines(stdout_lines);
             let stderr = join_lines(pr.errors.iter().map(ps_error_text).collect());
-            let shell_used = if cfg!(windows) { "powershell" } else { "winrm-powershell" };
+            let shell_used = if cfg!(windows) {
+                "powershell"
+            } else {
+                "winrm-powershell"
+            };
             ExecResult {
-                exit_code: exit_code.or(if pr.errors.is_empty() { Some(0) } else { Some(1) }),
+                exit_code: exit_code.or(if pr.errors.is_empty() {
+                    Some(0)
+                } else {
+                    Some(1)
+                }),
                 signal: None,
                 stdout,
                 stderr,

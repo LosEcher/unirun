@@ -95,8 +95,7 @@ pub fn serve() -> std::io::Result<()> {
         }
     });
 
-    let sessions: Arc<Mutex<HashMap<String, Session>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let sessions: Arc<Mutex<HashMap<String, Session>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -315,7 +314,11 @@ fn run_prompt(
     });
 
     if has_id {
-        let stop = if result.aborted { "cancelled" } else { "end_turn" };
+        let stop = if result.aborted {
+            "cancelled"
+        } else {
+            "end_turn"
+        };
         let _ = tx.send(Out::Response {
             id: request_id.unwrap_or(Value::Null),
             result: Ok(json!({ "stopReason": stop })),

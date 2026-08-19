@@ -89,22 +89,25 @@ pub fn start(spec: &ExecSpec, label: &str) -> Result<SessionState, String> {
     };
     let spec_path = dir.join("spec.json");
     write_json(&spec_path, &spec_rec)?;
-    write_json(&dir.join("state.json"), &SessionState {
-        id: id.clone(),
-        label: label.to_string(),
-        status: "running".into(),
-        pid: None,
-        started_at: now_millis(),
-        finished_at: None,
-        exit_code: None,
-        error_class: None,
-        hint: None,
-        truncated: false,
-        truncated_log: false,
-        duration_ms: 0,
-        encoding: String::new(),
-        shell_used: String::new(),
-    })?;
+    write_json(
+        &dir.join("state.json"),
+        &SessionState {
+            id: id.clone(),
+            label: label.to_string(),
+            status: "running".into(),
+            pid: None,
+            started_at: now_millis(),
+            finished_at: None,
+            exit_code: None,
+            error_class: None,
+            hint: None,
+            truncated: false,
+            truncated_log: false,
+            duration_ms: 0,
+            encoding: String::new(),
+            shell_used: String::new(),
+        },
+    )?;
 
     // The runner is this same binary re-exec'd. `UNIRUN_BIN` overrides the
     // executable path for embedding hosts and tests (where current_exe() is
@@ -186,10 +189,7 @@ pub fn run_runner(session_dir: &Path) -> i32 {
     let spec = ExecSpec {
         command: spec_rec.command.clone(),
         kind: crate::spec::ExecKind::Run,
-        shell: spec_rec
-            .shell
-            .as_deref()
-            .and_then(Shell::from_name),
+        shell: spec_rec.shell.as_deref().and_then(Shell::from_name),
         workdir: spec_rec.workdir.as_ref().map(PathBuf::from),
         timeout_ms: spec_rec.timeout_ms,
         ..Default::default()
@@ -387,8 +387,8 @@ fn session_dir(id: &str) -> PathBuf {
 
 fn load_state(id: &str) -> Result<SessionState, String> {
     let path = session_dir(id).join("state.json");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("no such session `{}`: {}", id, e))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("no such session `{}`: {}", id, e))?;
     serde_json::from_str(&text).map_err(|e| format!("session `{}` state corrupt: {}", id, e))
 }
 

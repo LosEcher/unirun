@@ -93,12 +93,9 @@ v1 server over stdio (baseline surface: `initialize`, `session/new`,
 `session/prompt` with streamed `session/update` output, `session/cancel`).
 A client sends the command as the prompt text — or as a JSON spec
 (`{"command": "…", "shell": "…", "timeout": 30, "workdir": "…", "env": {…}}`) —
-and receives the normalized result as the final streamed chunk. Example
-config for Zed's ACP agent host:
-
-```json
-{ "mcpServers": {}, "agent": { "command": "unirun", "args": ["acp"] } }
-```
+and receives the normalized result as the final streamed chunk. Any ACP v1
+host (Zed, Cursor, …) can be pointed at `unirun acp` as a "run this command"
+agent.
 
 ### Background sessions
 

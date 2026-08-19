@@ -294,17 +294,38 @@ mod tests {
     #[test]
     fn builtin_matches_common_ecosystems() {
         let cases: &[(&str, &str)] = &[
-            ("ModuleNotFoundError: No module named 'requests'", "DEPENDENCY_MISSING"),
-            ("ERROR: No matching distribution found for foo", "DEPENDENCY_MISSING"),
+            (
+                "ModuleNotFoundError: No module named 'requests'",
+                "DEPENDENCY_MISSING",
+            ),
+            (
+                "ERROR: No matching distribution found for foo",
+                "DEPENDENCY_MISSING",
+            ),
             ("Error: Cannot find module 'lodash'", "DEPENDENCY_MISSING"),
-            ("error[E0432]: unresolved import `serde`", "DEPENDENCY_MISSING"),
+            (
+                "error[E0432]: unresolved import `serde`",
+                "DEPENDENCY_MISSING",
+            ),
             ("error[E0308]: mismatched types", "COMPILE_ERROR"),
-            ("no required module provides package github.com/x/y", "DEPENDENCY_MISSING"),
-            ("fatal: unable to access 'https://github.com/x/y.git/'", "NETWORK"),
+            (
+                "no required module provides package github.com/x/y",
+                "DEPENDENCY_MISSING",
+            ),
+            (
+                "fatal: unable to access 'https://github.com/x/y.git/'",
+                "NETWORK",
+            ),
             ("curl: (6) Could not resolve host: example.com", "NETWORK"),
             ("bash: foo: command not found", "COMMAND_NOT_FOUND"),
-            ("fatal: not a git repository (or any of the parent directories)", "NOT_FOUND"),
-            ("denied: requested access to the resource is denied", "PERMISSION"),
+            (
+                "fatal: not a git repository (or any of the parent directories)",
+                "NOT_FOUND",
+            ),
+            (
+                "denied: requested access to the resource is denied",
+                "PERMISSION",
+            ),
         ];
         for (stderr, expected) in cases {
             let (class, hint) = match_builtin(&flatten(stderr)).expect(stderr);
