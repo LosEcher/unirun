@@ -1,8 +1,8 @@
 //! unirun — cross-platform command execution normalization for AI agents.
 //!
 //! Library surface: `ExecSpec` in → `ExecResult` out, same shape on every
-//! platform. Binaries: `unirun run|script|probe` (see `main.rs`) and, from
-//! P1, the MCP server.
+//! platform. Binaries: `unirun run|script|probe|ssh|mcp|acp|bg|recipe`
+//! (see `main.rs`), plus the optional `winrm`-feature WinRM provider.
 
 pub mod acp;
 pub mod encoding;

@@ -1,6 +1,6 @@
 [package]
 name = "unirun"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Cross-platform command execution normalization for AI agents — one command spec in, one normalized result out, on any platform."
 license = "MIT"
@@ -24,3 +24,10 @@ path = "src/main.rs"
 [features]
 default = []
 winrm = ["dep:psrp-rs", "dep:winrm-rs"]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "exec_bench"
+harness = false

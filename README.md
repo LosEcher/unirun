@@ -64,14 +64,19 @@ unirun run '<command>' [--timeout 30] [--shell bash] [--workdir dir] [--env K=V]
 unirun script path/to/script [options]     # shell inferred from extension
 unirun probe [--json]                      # host capability snapshot
 unirun mcp                                 # serve MCP over stdio (agents)
-unirun ssh <host> '<script>' [--shell powershell|pwsh|cmd]   # remote Windows
+unirun acp                                 # serve Agent Client Protocol v1 over stdio
+unirun ssh <host> '<script>' [--shell powershell|pwsh|cmd]   # remote Windows (SSH)
+unirun winrm <host> '<script>' [opts]      # remote Windows (WinRM; feature: winrm)
+unirun bg <start|status|output|kill|wait|list> ...   # background sessions
+unirun recipe <list|show|add|rm|path|effective|check> # recipe registry
 ```
 
 ### MCP — plug into any agent
 
-`unirun mcp` is a stdio MCP server exposing `exec.run`, `exec.script` and
-`exec.probe` (JSON-RPC 2.0, newline-delimited). Point any MCP-capable agent
-at it:
+`unirun mcp` is a stdio MCP server exposing `exec.run`, `exec.script`,
+`exec.probe` and the background-session tools `session.start`, `session.status`,
+`session.output`, `session.kill`, `session.wait`, `session.list`
+(JSON-RPC 2.0, newline-delimited). Point any MCP-capable agent at it:
 
 ```json
 // Claude Desktop / Cursor / DSH mcp config
@@ -81,21 +86,75 @@ at it:
 Tools return the normalized `ExecResult` JSON (exit_code / error_class /
 hint / encoding / truncated), with `isError` reflecting the taxonomy class.
 
-### Remote Windows execution (SSH)
+### ACP — drive it from Zed / Cursor / any ACP v1 client
 
-`unirun ssh` is the win-exec knowledge ported to Rust: UTF-16LE
+`unirun acp` is an [Agent Client Protocol](https://agentclientprotocol.com)
+v1 server over stdio (baseline surface: `initialize`, `session/new`,
+`session/prompt` with streamed `session/update` output, `session/cancel`).
+A client sends the command as the prompt text — or as a JSON spec
+(`{"command": "…", "shell": "…", "timeout": 30, "workdir": "…", "env": {…}}`) —
+and receives the normalized result as the final streamed chunk. Example
+config for Zed's ACP agent host:
+
+```json
+{ "mcpServers": {}, "agent": { "command": "unirun", "args": ["acp"] } }
+```
+
+### Background sessions
+
+Long-running work without blocking the agent loop — start, poll, kill,
+collect output later:
+
+```bash
+$ unirun bg start 'pnpm build' --label web-build
+session 862718cd5514c7ea4d380 started (pid 12345) — web-build
+
+$ unirun bg status 862718cd5514c7ea4d380          # running | completed | timed_out | aborted | …
+$ unirun bg wait 862718cd5514c7ea4d380 --timeout 300 --json
+$ unirun bg output 862718cd5514c7ea4d380 --tail 65536
+$ unirun bg kill 862718cd5514c7ea4d380
+$ unirun bg list
+```
+
+Sessions live in `$UNIRUN_HOME/sessions` (default `~/.unirun/sessions`),
+survive the launching CLI, and stream decoded output to `stdout.log` /
+`stderr.log` (1 MiB cap, flagged `truncated_log`). The same API is exposed
+as MCP `session.*` tools. Exit-code contract for `bg wait` mirrors the CLI:
+completed rc mirrors the child, timed out 124, aborted/killed 130.
+
+### Remote Windows execution
+
+**SSH** (`unirun ssh`) is the win-exec knowledge ported to Rust: UTF-16LE
 `-EncodedCommand` payloads, auto-injected UTF-8 "golden recipe" (no
 CLIXML/GBK mojibake), exact exit-code propagation via `exit $LASTEXITCODE`,
 and automatic scp + `-File` fallback for large scripts (UTF-8 BOM so Chinese
 content works). cmd.exe targets run via temp `.bat` files.
 
+**WinRM** (`unirun winrm`, build with `--features winrm`) is a POC over
+[psrp-rs](https://crates.io/crates/psrp-rs) (PowerShell Remoting Protocol on
+WS-Management) for hosts that expose WinRM instead of OpenSSH — HTTP 5985 /
+HTTPS 5986, Basic / NTLM / Kerberos auth:
+
+```bash
+unirun winrm win-srv 'Get-Process | Select-Object -First 5 Name, Id' \
+  --user administrator --password '…' --tls --insecure
+```
+
+Output arrives CLIXML-decoded (clean UTF-8) and the exit code is propagated
+via a `$LASTEXITCODE` sentinel; the PSRP error stream becomes stderr, so the
+normalized `ExecResult` and taxonomy apply. Known PSRP limit: a top-level
+`exit N` terminates the runspace before the sentinel runs — prefer native
+commands (e.g. `cmd /c exit N`) to set `$LASTEXITCODE`.
+
 ### Per-project adaptation (recipes)
 
 Ship a `.unirun/recipe.toml` in a project and unirun auto-applies it
-(toolchain runners, timeouts, output caps):
+(toolchain runners, timeouts, output caps, **error maps**):
 
 ```toml
 schema = 1
+extends = ["python"]               # layer a registry recipe underneath (optional)
+
 [toolchains.python]
 runner = "uv"
 fallbacks = ["python3", "py"]
@@ -111,12 +170,23 @@ max_output_bytes = 262144
 [timeouts]
 default_ms = 30000
 
-[error_maps]
+[error_maps]                       # project patterns win over the built-in library
 "ModuleNotFoundError: *" = { class = "DEPENDENCY_MISSING", hint = "run `uv sync`" }
 ```
 
 ```bash
 unirun script main.py --toolchain python --json   # → uv run main.py
+```
+
+**Recipe registry** (`unirun recipe`) keeps reusable named recipes in
+`$UNIRUN_HOME/recipes` and layers them via `extends` (deep merge: built-in
+defaults ← registry layers ← project recipe; `toolchains`/`error_maps` merge
+per key, `conventions`/`timeouts` overlay per present field):
+
+```bash
+unirun recipe add python ~/dotfiles/recipes/python.toml   # register once
+unirun recipe list / show python / rm python / path / check
+unirun recipe effective --workdir .                        # merged project recipe
 ```
 
 Capability results are cached at `.unirun/capabilities.json` with a drift
@@ -147,24 +217,49 @@ result (including `exit_code` and `error_class`) is in the JSON.
 | `NOT_FOUND`          | "No such file or directory"                     |
 | `DEPENDENCY_MISSING` | ModuleNotFoundError and friends                 |
 | `SYNTAX`             | shell syntax error                              |
+| `NETWORK`            | unreachable host / repo / registry (P2)         |
+| `COMPILE_ERROR`      | compiler/toolchain diagnostics (P2)             |
 | `UNKNOWN_FAILURE`    | non-zero exit with unrecognized stderr          |
 | *(none)*             | success, or explicit non-zero exit w/o evidence |
 
 Classification is **evidence-based**: unirun never invents a class without a
 confirmed pattern, so an explicit `exit 42` stays class-less (rc is the signal).
+Built-in patterns live in the public **error-map library** (`unirun::error_maps`,
+curated for Python / Node / Rust / Go / TypeScript / Git / network), matched as
+case-insensitive substrings on whitespace-flattened stderr; project recipe
+`[error_maps]` patterns are consulted first (project knowledge beats generic
+heuristics).
+
+### Performance benchmarks
+
+Library-level (criterion, `cargo bench`) on this M1 Mac — the full pipeline:
+spawn + process-group setup, streaming capture, encoding, classification:
+
+| Benchmark                     | Time            |
+|-------------------------------|-----------------|
+| `true` through bash           | ~23 ms          |
+| `echo hello`                  | ~23 ms          |
+| Unicode output (中文)         | ~23 ms          |
+| 10 MiB output (capped drain)  | ~35 ms          |
+| Timeout + tree-kill latency   | ~153 ms (100 ms deadline + kill) |
+
+End-to-end CLI (`scripts/bench.sh`, release binary, hyperfine if present else
+a python timing loop): a bare `unirun run 'echo hello'` lands at ~16 ms on
+this host — the normalization pipeline is effectively free next to the shell
+spawn itself.
 
 ## Roadmap
 
 - **P0 (released)** — local execution normalization: probe, in-process
   timeout, tree kill, encoding pipeline, taxonomy, CLI `--json`.
-- **P1 (released)** — MCP server (`exec.run` / `exec.script` / `exec.probe`),
-  SSH-remote transport (win-exec port: EncodedCommand / scp fallback / BOM /
-  exit contract — verified against a real Windows node), per-project recipe
-  system (`.unirun/recipe.toml`, toolchain runners, capability cache),
-  Windows CI matrix.
-- **P2** — Windows local execution polish, error-map libraries, recipe
-  registry, background sessions, ACP, WinRM provider (psrp-rs POC),
-  performance benchmarks.
+- **P1 (released)** — MCP server, SSH-remote transport (win-exec port),
+  per-project recipe system, Windows CI matrix.
+- **P2 (released)** — error-map library, recipe registry (`extends` +
+  `unirun recipe`), background sessions (`unirun bg` + MCP `session.*`),
+  ACP v1 server (`unirun acp`), WinRM provider (psrp-rs POC, `winrm`
+  feature), performance benchmarks.
+- **P3 (backlog)** — Windows local execution polish, session resume/replay,
+  per-stream caps, recipe schema registry (semver'd), transport plugins.
 
 Independent by design: MCP + CLI only, no harness dependency, no telemetry,
 MIT licensed.
