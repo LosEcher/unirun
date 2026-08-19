@@ -50,6 +50,38 @@ unirun makes this matrix a solved, tested, shared problem:
 
 ## Install
 
+Prebuilt binaries are attached to each [GitHub Release](https://github.com/LosEcher/unirun/releases).
+Assets follow a fixed `unirun-<os>-<arch>` naming contract so installers
+(Dockerfiles, deploy scripts, agent toolchains) can resolve the right file
+deterministically — never a bare `unirun`:
+
+| Asset | Platform |
+|---|---|
+| `unirun-linux-x86_64` | Linux x86_64 (glibc) |
+| `unirun-linux-x86_64-musl` | Linux x86_64, static musl — Alpine / distroless Docker |
+| `unirun-linux-aarch64-musl` | Linux arm64, static musl — ARM NAS, Raspberry Pi |
+| `unirun-macos-aarch64` | macOS Apple Silicon |
+| `unirun-windows-x86_64.exe` | Windows x86_64 |
+
+```bash
+# Linux/macOS — pick the asset for your platform
+curl -fL -o unirun \
+  https://github.com/LosEcher/unirun/releases/latest/download/unirun-linux-x86_64
+chmod +x unirun && ./unirun probe
+```
+
+Alpine/Docker install step (static musl build — no glibc needed):
+
+```dockerfile
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates \
+ && wget -qO /usr/local/bin/unirun \
+      https://github.com/LosEcher/unirun/releases/latest/download/unirun-linux-x86_64-musl \
+ && chmod +x /usr/local/bin/unirun
+```
+
+Or from source (any platform, including macOS Intel):
+
 ```bash
 # From source (Rust 1.70+)
 cargo install unirun
