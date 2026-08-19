@@ -83,6 +83,13 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        "acp" => {
+            if let Err(e) = unirun::acp::serve() {
+                eprintln!("unirun acp: {}", e);
+                return ExitCode::from(1);
+            }
+            ExitCode::SUCCESS
+        }
         other => {
             eprintln!("unirun: unknown subcommand `{}`", other);
             eprintln!("{}", HELP);

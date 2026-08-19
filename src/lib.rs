@@ -4,6 +4,7 @@
 //! platform. Binaries: `unirun run|script|probe` (see `main.rs`) and, from
 //! P1, the MCP server.
 
+pub mod acp;
 pub mod encoding;
 pub mod error_maps;
 pub mod exec;
