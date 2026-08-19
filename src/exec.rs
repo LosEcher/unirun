@@ -224,9 +224,11 @@ fn shell_argv(shell: Shell, spec: &ExecSpec) -> Vec<String> {
         Shell::Pwsh | Shell::Powershell => {
             // Local PowerShell: inject the UTF-8 "golden recipe" so stdout and
             // stderr are clean UTF-8 instead of CLIXML/OEM mojibake — the same
-            // normalization the SSH transport applies remotely. The recipe is
-            // output-only; the command's own exit semantics are untouched.
-            let recipe = "$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8;";
+            // normalization the SSH transport applies remotely. Each setter is
+            // try/catch-guarded: in a no-console (piped) environment,
+            // [Console]::OutputEncoding can throw a non-terminating "handle is
+            // invalid" error that would otherwise pollute stderr.
+            let recipe = "$ProgressPreference='SilentlyContinue';try{[Console]::OutputEncoding=[Text.Encoding]::UTF8}catch{};try{$OutputEncoding=[Text.Encoding]::UTF8}catch{};";
             vec![
                 shell.as_str().to_string(),
                 "-NoProfile".into(),
