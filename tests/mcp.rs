@@ -140,7 +140,11 @@ fn mcp_exec_run_error_flag_and_class() {
     assert_eq!(result["isError"], serde_json::json!(true));
     let parsed: serde_json::Value =
         serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(parsed["error_class"], "COMMAND_NOT_FOUND");
+    assert_eq!(
+        parsed["error_class"], "COMMAND_NOT_FOUND",
+        "full result: {}",
+        parsed
+    );
     s.close();
 }
 
