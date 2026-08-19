@@ -598,12 +598,12 @@ runner = "uv"
         assert!(joined.contains("cycle"), "{}", joined);
     }
 
-    // Registry tests mutate UNIRUN_HOME; serialize them so parallel threads
-    // can't observe each other's environment.
-    static REG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    // Registry tests mutate UNIRUN_HOME; serialize them with the shared env
+    // lock so parallel threads can't observe each other's environment.
     fn with_temp_registry(f: impl FnOnce(&std::path::Path)) {
-        let _guard = REG_LOCK.lock().unwrap_or_else(|e| e.into_inner()); // a panicking test must not wedge the others
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()); // a panicking test must not wedge the others
         let dir = std::env::temp_dir().join(format!("unirun-reg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

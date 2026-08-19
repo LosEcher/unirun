@@ -16,7 +16,16 @@ pub mod spec;
 pub mod taxonomy;
 pub mod transport;
 
+#[cfg(feature = "winrm")]
+pub mod winrm;
+
 pub use exec::{install_sigint_handler, reset_abort, run};
 pub use probe::{probe, Capabilities};
 pub use spec::{ExecKind, ExecResult, ExecSpec, Shell};
 pub use transport::{ssh_run, SshTarget};
+
+/// Serializes tests that mutate process-wide environment (`UNIRUN_HOME`,
+/// `UNIRUN_BIN`, …) — the recipe-registry and session tests both touch it
+/// and must never observe each other's value mid-mutation.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

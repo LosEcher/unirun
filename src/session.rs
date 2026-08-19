@@ -496,6 +496,9 @@ mod tests {
 
     #[test]
     fn sessions_dir_uses_unirun_home() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = temp_home("dir");
         std::env::set_var("UNIRUN_HOME", &home);
         assert_eq!(sessions_dir(), home.join("sessions"));

@@ -67,6 +67,7 @@ fn main() -> ExitCode {
         "script" => cmd_script(&args[1..]),
         "probe" => cmd_probe(&args[1..]),
         "ssh" => cmd_ssh(&args[1..]),
+        "winrm" => cmd_winrm(&args[1..]),
         "recipe" => cmd_recipe(&args[1..]),
         "bg" => cmd_bg(&args[1..]),
         "__bg-runner" => {
@@ -758,4 +759,96 @@ fn truncate_label(command: &str) -> String {
         s.push('…');
     }
     s
+}
+
+#[cfg(feature = "winrm")]
+const WINRM_HELP: &str = "\
+unirun winrm — run PowerShell on a remote Windows host over WinRM (psrp-rs POC)
+
+USAGE:
+  unirun winrm <host> '<script>' [--user U] [--password P] [--domain D]
+               [--port N] [--tls] [--insecure] [--auth basic|ntlm|kerberos]
+               [--timeout N] [--json] [--pretty]
+
+Defaults: HTTP port 5985, NTLM auth. Requires a `winrm`-feature build
+(cargo install unirun --features winrm).
+";
+
+#[cfg(not(feature = "winrm"))]
+fn cmd_winrm(_args: &[String]) -> ExitCode {
+    eprintln!("unirun: built without WinRM support; rebuild with `cargo build --features winrm`");
+    ExitCode::from(1)
+}
+
+#[cfg(feature = "winrm")]
+fn cmd_winrm(args: &[String]) -> ExitCode {
+    use unirun::winrm::{winrm_run, WinrmAuth, WinrmTarget};
+    let mut target = WinrmTarget::default();
+    let mut timeout_sec: Option<u64> = None;
+    let mut json = false;
+    let mut pretty = false;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    let fail = |msg: &str| -> ExitCode {
+        eprintln!("unirun winrm: {}", msg);
+        ExitCode::from(2)
+    };
+    while i < args.len() {
+        let a = &args[i];
+        let next = |i: &mut usize| -> Option<&String> {
+            *i += 1;
+            args.get(*i)
+        };
+        match a.as_str() {
+            "--json" => json = true,
+            "--pretty" => {
+                json = true;
+                pretty = true;
+            }
+            "--user" => match next(&mut i) {
+                Some(v) => target.username = v.clone(),
+                None => return fail("--user needs a value"),
+            },
+            "--password" => match next(&mut i) {
+                Some(v) => target.password = v.clone(),
+                None => return fail("--password needs a value"),
+            },
+            "--domain" => match next(&mut i) {
+                Some(v) => target.domain = v.clone(),
+                None => return fail("--domain needs a value"),
+            },
+            "--port" => match next(&mut i).and_then(|v| v.parse().ok()) {
+                Some(p) => target.port = p,
+                None => return fail("--port needs an integer"),
+            },
+            "--tls" => target.use_tls = true,
+            "--insecure" => target.accept_invalid_certs = true,
+            "--auth" => match next(&mut i).and_then(|v| WinrmAuth::from_name(v)) {
+                Some(auth) => target.auth = auth,
+                None => return fail("--auth must be basic | ntlm | kerberos"),
+            },
+            "--timeout" => match next(&mut i).and_then(|v| v.parse().ok()) {
+                Some(t) => timeout_sec = Some(t),
+                None => return fail("--timeout needs integer seconds"),
+            },
+            other => positional.push(other.to_string()),
+        }
+        i += 1;
+    }
+    if positional.len() < 2 {
+        eprintln!("{}", WINRM_HELP);
+        return ExitCode::from(2);
+    }
+    target.host = positional[0].clone();
+    let script = positional[1..].join(" ");
+    if let Some(t) = timeout_sec {
+        target.timeout_ms = t * 1000;
+    }
+    let result = winrm_run(&target, &script);
+    let opts = CliOpts {
+        json,
+        pretty,
+        ..Default::default()
+    };
+    emit(&result, &opts, pretty)
 }

@@ -14,7 +14,13 @@ serde_json = "1"
 libc = "0.2"
 toml = "0.8"
 base64 = "0.22"
+psrp-rs = { version = "1", optional = true }
+winrm-rs = { version = "1", optional = true }
 
 [[bin]]
 name = "unirun"
 path = "src/main.rs"
+
+[features]
+default = []
+winrm = ["dep:psrp-rs", "dep:winrm-rs"]
