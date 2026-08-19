@@ -18,7 +18,7 @@
 use crate::encoding::decode;
 use crate::probe::which;
 use crate::spec::{ExecKind, ExecResult, ExecSpec, Shell};
-use crate::taxonomy::classify;
+use crate::taxonomy::classify_with_maps;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -170,7 +170,12 @@ pub fn run(spec: &ExecSpec) -> ExecResult {
         truncated: stdout_trunc || stderr_trunc,
         shell_used: shell,
     };
-    let (class, hint) = classify(&result);
+    let recipe_maps = if spec.error_maps.is_empty() {
+        None
+    } else {
+        Some(&spec.error_maps)
+    };
+    let (class, hint) = classify_with_maps(&result, recipe_maps);
     result.error_class = class;
     result.hint = hint;
     result

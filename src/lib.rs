@@ -5,6 +5,7 @@
 //! P1, the MCP server.
 
 pub mod encoding;
+pub mod error_maps;
 pub mod exec;
 pub mod mcp;
 pub mod probe;

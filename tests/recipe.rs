@@ -143,6 +143,39 @@ runner = "this_runner_does_not_exist_xyz"
 }
 
 #[test]
+fn recipe_error_maps_reach_classification() {
+    // P2: recipe `[error_maps]` patterns must be applied during classification
+    // (project knowledge beats the built-in library).
+    let dir = tmp_dir("errmap");
+    write_recipe(
+        &dir,
+        r#"
+[error_maps]
+"custom tool error: *" = { class = "DEPENDENCY_MISSING", hint = "run setup first" }
+"#,
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_unirun"))
+        .args([
+            "run",
+            "echo 'custom tool error: widget' >&2; exit 3",
+            "--workdir",
+        ])
+        .arg(&dir)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed["error_class"], "DEPENDENCY_MISSING");
+    assert_eq!(parsed["hint"], "run setup first");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn cli_mcp_stdin_streams_one_line_per_request() {
     // Sanity: `unirun mcp` speaks newline-delimited JSON (already covered in
     // tests/mcp.rs); here we just verify the binary exposes the subcommand.

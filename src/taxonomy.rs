@@ -6,13 +6,33 @@
 //!
 //!   TIMEOUT · ABORTED · COMMAND_NOT_FOUND · PERMISSION · EXEC_FORMAT
 //!   NOT_FOUND · DEPENDENCY_MISSING · SYNTAX · UNKNOWN_FAILURE
+//!   NETWORK · COMPILE_ERROR          (added with the P2 error-map library)
+//!
+//! Matching order (first hit wins):
+//!   1. structural cases handled here (timeout / abort / POSIX exit codes)
+//!   2. project recipe `[error_maps]` patterns (`classify_with_maps`)
+//!   3. the built-in pattern library (`error_maps` module)
+//!   4. `UNKNOWN_FAILURE` / no-evidence fallback
 
+use crate::error_maps;
+use crate::recipe::ErrorMapEntry;
 use crate::spec::ExecResult;
+use std::collections::BTreeMap;
 
-/// Classify a finished run. `None` class means no confirmed error — either
-/// success, an explicit non-zero exit without error evidence, or an aborted
-/// run (unirun never invents a class without evidence).
+/// Classify a finished run using only the built-in error-map library.
+/// `None` class means no confirmed error — either success, an explicit
+/// non-zero exit without error evidence, or an aborted run (unirun never
+/// invents a class without evidence).
 pub fn classify(r: &ExecResult) -> (Option<String>, Option<String>) {
+    classify_with_maps(r, None)
+}
+
+/// Classify with project recipe `[error_maps]` patterns consulted before the
+/// built-in library (project knowledge beats generic heuristics).
+pub fn classify_with_maps(
+    r: &ExecResult,
+    recipe_maps: Option<&BTreeMap<String, ErrorMapEntry>>,
+) -> (Option<String>, Option<String>) {
     if r.timed_out {
         return (
             Some("TIMEOUT".into()),
@@ -33,9 +53,9 @@ pub fn classify(r: &ExecResult) -> (Option<String>, Option<String>) {
     // Collapse all whitespace to single spaces: consoles wrap error text at
     // ~80 columns (PowerShell's "…the name of a\ncmdlet…" is real), and a
     // wrapped pattern must still match.
-    let flat: String = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = error_maps::flatten(&stderr);
 
-    // POSIX shell exit-code semantics (bash/sh/zsh).
+    // POSIX shell exit-code semantics (bash/sh/zsh) — structural, not pattern.
     if r.exit_code == Some(127) {
         return (
             Some("COMMAND_NOT_FOUND".into()),
@@ -51,42 +71,16 @@ pub fn classify(r: &ExecResult) -> (Option<String>, Option<String>) {
         return (Some("PERMISSION".into()), Some(hint));
     }
 
-    // stderr pattern matching (cross-platform heuristics).
-    if flat.contains("command not found")
-        || flat.contains("is not recognized as the name of a cmdlet")
-        || flat.contains("is not recognized as an internal or external command")
-    {
-        return (
-            Some("COMMAND_NOT_FOUND".into()),
-            Some("a command is missing; install it, or check PATH on the target".into()),
-        );
+    // Project recipe patterns first, then the built-in library.
+    if let Some(maps) = recipe_maps {
+        if !maps.is_empty() {
+            if let Some((class, hint)) = error_maps::match_recipe(&flat, maps) {
+                return (Some(class), Some(hint));
+            }
+        }
     }
-    if flat.contains("permission denied") {
-        return (
-            Some("PERMISSION".into()),
-            Some("the process lacks permission; check file ownership, mode bits, or policy".into()),
-        );
-    }
-    if flat.contains("module not found") || flat.contains("modulenotfounderror") {
-        return (
-            Some("DEPENDENCY_MISSING".into()),
-            Some("a Python dependency is missing; sync the project environment (e.g. `uv sync` / `pip install -r requirements.txt`)".into()),
-        );
-    }
-    if flat.contains("no such file or directory") || flat.contains("cannot find the path") {
-        return (
-            Some("NOT_FOUND".into()),
-            Some(
-                "a referenced file or directory does not exist; verify paths before retrying"
-                    .into(),
-            ),
-        );
-    }
-    if flat.contains("syntax error") || flat.contains("unexpected token") {
-        return (
-            Some("SYNTAX".into()),
-            Some("the script has a shell syntax error; review quoting and line structure".into()),
-        );
+    if let Some((class, hint)) = error_maps::match_builtin(&flat) {
+        return (Some(class.to_string()), Some(hint.to_string()));
     }
 
     if r.exit_code == Some(0) || r.stderr.trim().is_empty() {
@@ -170,5 +164,50 @@ mod tests {
         r.stderr = "something odd happened\n".into();
         let (class, _) = classify(&r);
         assert_eq!(class.as_deref(), Some("UNKNOWN_FAILURE"));
+    }
+
+    #[test]
+    fn builtin_library_classes_network_and_compile() {
+        let mut r = base();
+        r.exit_code = Some(128);
+        r.stderr =
+            "fatal: unable to access 'https://github.com/x/y.git/': Could not resolve host".into();
+        let (class, _) = classify(&r);
+        assert_eq!(class.as_deref(), Some("NETWORK"));
+
+        let mut r2 = base();
+        r2.exit_code = Some(101);
+        r2.stderr = "error[E0432]: unresolved import `serde`".into();
+        // E0432 has a specific DEPENDENCY_MISSING entry, checked first.
+        let (class, _) = classify(&r2);
+        assert_eq!(class.as_deref(), Some("DEPENDENCY_MISSING"));
+
+        let mut r3 = base();
+        r3.exit_code = Some(101);
+        r3.stderr = "error[E0308]: mismatched types".into();
+        let (class, _) = classify(&r3);
+        assert_eq!(class.as_deref(), Some("COMPILE_ERROR"));
+    }
+
+    #[test]
+    fn recipe_maps_override_builtin_hint() {
+        let mut maps = std::collections::BTreeMap::new();
+        maps.insert(
+            "ModuleNotFoundError: *".to_string(),
+            crate::recipe::ErrorMapEntry {
+                class: "DEPENDENCY_MISSING".into(),
+                hint: Some("project hint: uv sync".into()),
+            },
+        );
+        let mut r = base();
+        r.exit_code = Some(1);
+        r.stderr = "ModuleNotFoundError: No module named 'requests'".into();
+        let (class, hint) = classify_with_maps(&r, Some(&maps));
+        assert_eq!(class.as_deref(), Some("DEPENDENCY_MISSING"));
+        assert_eq!(hint.as_deref(), Some("project hint: uv sync"));
+
+        // Without the maps, the builtin hint applies instead.
+        let (_, hint2) = classify(&r);
+        assert!(hint2.unwrap().contains("uv sync"));
     }
 }

@@ -164,6 +164,9 @@ fn build_spec(command: String, kind: ExecKind, opts: &CliOpts) -> ExecSpec {
                 spec.max_output_bytes = m as usize;
             }
         }
+        if spec.error_maps.is_empty() {
+            spec.error_maps = recipe.error_maps.clone();
+        }
     }
     spec
 }

@@ -221,6 +221,22 @@ fn spec_from_args(args: &Value) -> ExecSpec {
             .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
             .collect();
     }
+    // Per-project adaptation: apply the nearest recipe's error maps so
+    // project-specific `[error_maps]` hints reach MCP clients too.
+    let base = spec
+        .workdir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    if let Some(recipe) = crate::recipe::Recipe::load_from_dir(&base) {
+        if spec.max_output_bytes == 0 {
+            if let Some(m) = recipe.max_output_bytes() {
+                spec.max_output_bytes = m as usize;
+            }
+        }
+        if spec.error_maps.is_empty() {
+            spec.error_maps = recipe.error_maps.clone();
+        }
+    }
     spec
 }
 
