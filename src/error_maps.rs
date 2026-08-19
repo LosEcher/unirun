@@ -106,6 +106,11 @@ pub const BUILTIN: &[ErrorPattern] = &[
     },
     // --- Python ---
     ErrorPattern {
+        pattern: "windows subsystem for linux has no installed distributions",
+        class: "COMMAND_NOT_FOUND",
+        hint: "the WSL bash shim was invoked with no distro installed; install a WSL distribution or use Git Bash / PowerShell",
+    },
+    ErrorPattern {
         pattern: "modulenotfounderror",
         class: "DEPENDENCY_MISSING",
         hint: "a Python module is missing; sync the project environment (e.g. `uv sync` / `pip install -r requirements.txt`)",

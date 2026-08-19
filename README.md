@@ -24,6 +24,9 @@ re-solves the same cross-platform execution matrix:
 - PowerShell 5.1 emits CLIXML / GBK mojibake instead of UTF-8;
 - cmd.exe eats `>` before PowerShell ever sees it;
 - PowerShell doesn't propagate native exit codes;
+- Windows' `System32\bash.exe` is the WSL launcher — with no distro installed
+  it prints a UTF-16LE "no distributions" message and exits 1 (unirun's probe
+  excludes it; real Git Bash still resolves);
 - output formats drift between OS versions (`iostat`, `netstat`, …).
 
 unirun makes this matrix a solved, tested, shared problem:

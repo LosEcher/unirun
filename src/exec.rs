@@ -101,7 +101,16 @@ fn run_inner(
         Some(a) => (a.first().cloned().unwrap_or_default(), a.clone()),
         None => {
             let shell = resolve_shell(spec);
-            let argv = shell_argv(shell, spec);
+            let mut argv = shell_argv(shell, spec);
+            // Resolve the shell binary through `which()` so Windows never
+            // spawns the WSL launcher (`System32\bash.exe` — prints a
+            // UTF-16LE "no distributions" message and exits 1) instead of a
+            // real bash. which() excludes that shim; when no real shell is
+            // found the bare name is kept and the spawn-error path reports
+            // COMMAND_NOT_FOUND.
+            if let Some(found) = which(&argv[0]) {
+                argv[0] = found;
+            }
             (shell.as_str().to_string(), argv)
         }
     };
