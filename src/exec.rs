@@ -151,20 +151,22 @@ pub fn run(spec: &ExecSpec) -> ExecResult {
 
     let (stdout_raw, stdout_trunc) = join_capture(stdout_thread);
     let (stderr_raw, stderr_trunc) = join_capture(stderr_thread);
-    let stdout = decode(&stdout_raw);
-    let stderr = decode(&stderr_raw);
+    let stdout_decoded = decode(&stdout_raw);
+    let stderr_decoded = decode(&stderr_raw);
+    let stdout = crate::encoding::normalize_line_endings(&stdout_decoded.text);
+    let stderr = crate::encoding::normalize_line_endings(&stderr_decoded.text);
 
     let mut result = ExecResult {
         exit_code,
         signal,
-        stdout: stdout.text,
-        stderr: stderr.text,
+        stdout,
+        stderr,
         timed_out,
         aborted,
         duration_ms: start.elapsed().as_millis() as u64,
         error_class: None,
         hint: None,
-        encoding: stdout.encoding.to_string(),
+        encoding: stdout_decoded.encoding.to_string(),
         truncated: stdout_trunc || stderr_trunc,
         shell_used: shell,
     };
@@ -306,8 +308,12 @@ fn kill_tree(child: &mut Child, grace: Duration) {
 /// Windows tree termination via `taskkill /T /F` (P0: contained best-effort).
 #[cfg(windows)]
 fn kill_tree(child: &Child, _grace: Duration) {
+    // taskkill writes "SUCCESS: ... terminated." to stdout — silence it so
+    // protocol streams (e.g. MCP) stay clean.
     let _ = Command::new("taskkill")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 }
 

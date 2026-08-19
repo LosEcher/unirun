@@ -8,6 +8,16 @@ pub struct Decoded {
     pub encoding: &'static str,
 }
 
+/// Normalize CRLF to LF in decoded text (Windows shells emit `\r\n`;
+/// agents should see the same line endings on every platform).
+pub fn normalize_line_endings(text: &str) -> String {
+    if text.contains("\r\n") {
+        text.replace("\r\n", "\n")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Decode raw child output to Unicode text.
 ///
 /// Strategy:

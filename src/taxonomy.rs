@@ -48,7 +48,10 @@ pub fn classify(r: &ExecResult) -> (Option<String>, Option<String>) {
     }
 
     // stderr pattern matching (cross-platform heuristics).
-    if stderr.contains("command not found") {
+    if stderr.contains("command not found")
+        || stderr.contains("is not recognized as the name of a cmdlet")
+        || stderr.contains("is not recognized as an internal or external command")
+    {
         return (
             Some("COMMAND_NOT_FOUND".into()),
             Some("a command is missing; install it, or check PATH on the target".into()),

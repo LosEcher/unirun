@@ -181,21 +181,23 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str) -> ExecResult {
     }
     let (out_raw, _) = to.join().unwrap_or((Vec::new(), false));
     let (err_raw, _) = te.join().unwrap_or((Vec::new(), false));
-    let stdout = crate::encoding::decode(&out_raw);
+    let stdout_decoded = crate::encoding::decode(&out_raw);
     let stderr_raw = filter_banner(&err_raw);
-    let stderr = crate::encoding::decode(&stderr_raw);
+    let stderr_decoded = crate::encoding::decode(&stderr_raw);
+    let stdout = crate::encoding::normalize_line_endings(&stdout_decoded.text);
+    let stderr = crate::encoding::normalize_line_endings(&stderr_decoded.text);
 
     let mut result = ExecResult {
         exit_code,
         signal: None,
-        stdout: stdout.text,
-        stderr: stderr.text,
+        stdout,
+        stderr,
         timed_out,
         aborted: false,
         duration_ms: start.elapsed().as_millis() as u64,
         error_class: None,
         hint: None,
-        encoding: stdout.encoding.to_string(),
+        encoding: stdout_decoded.encoding.to_string(),
         truncated: false,
         shell_used: target.shell.as_str().to_string(),
     };
@@ -316,5 +318,7 @@ fn kill_ssh_tree(child: &mut Child, grace: Duration) {
 fn kill_ssh_tree(child: &Child, _grace: Duration) {
     let _ = Command::new("taskkill")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 }
