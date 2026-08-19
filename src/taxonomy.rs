@@ -30,6 +30,10 @@ pub fn classify(r: &ExecResult) -> (Option<String>, Option<String>) {
     }
 
     let stderr = r.stderr.to_lowercase();
+    // Collapse all whitespace to single spaces: consoles wrap error text at
+    // ~80 columns (PowerShell's "…the name of a\ncmdlet…" is real), and a
+    // wrapped pattern must still match.
+    let flat: String = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
 
     // POSIX shell exit-code semantics (bash/sh/zsh).
     if r.exit_code == Some(127) {
@@ -39,7 +43,7 @@ pub fn classify(r: &ExecResult) -> (Option<String>, Option<String>) {
         );
     }
     if r.exit_code == Some(126) {
-        let hint = if stderr.contains("permission denied") {
+        let hint = if flat.contains("permission denied") {
             "the script file lacks execute permission, or the command cannot be executed".into()
         } else {
             "the script file exists but cannot be executed (wrong format or interpreter)".into()
@@ -48,28 +52,28 @@ pub fn classify(r: &ExecResult) -> (Option<String>, Option<String>) {
     }
 
     // stderr pattern matching (cross-platform heuristics).
-    if stderr.contains("command not found")
-        || stderr.contains("is not recognized as the name of a cmdlet")
-        || stderr.contains("is not recognized as an internal or external command")
+    if flat.contains("command not found")
+        || flat.contains("is not recognized as the name of a cmdlet")
+        || flat.contains("is not recognized as an internal or external command")
     {
         return (
             Some("COMMAND_NOT_FOUND".into()),
             Some("a command is missing; install it, or check PATH on the target".into()),
         );
     }
-    if stderr.contains("permission denied") {
+    if flat.contains("permission denied") {
         return (
             Some("PERMISSION".into()),
             Some("the process lacks permission; check file ownership, mode bits, or policy".into()),
         );
     }
-    if stderr.contains("module not found") || stderr.contains("modulenotfounderror") {
+    if flat.contains("module not found") || flat.contains("modulenotfounderror") {
         return (
             Some("DEPENDENCY_MISSING".into()),
             Some("a Python dependency is missing; sync the project environment (e.g. `uv sync` / `pip install -r requirements.txt`)".into()),
         );
     }
-    if stderr.contains("no such file or directory") || stderr.contains("cannot find the path") {
+    if flat.contains("no such file or directory") || flat.contains("cannot find the path") {
         return (
             Some("NOT_FOUND".into()),
             Some(
@@ -78,7 +82,7 @@ pub fn classify(r: &ExecResult) -> (Option<String>, Option<String>) {
             ),
         );
     }
-    if stderr.contains("syntax error") || stderr.contains("unexpected token") {
+    if flat.contains("syntax error") || flat.contains("unexpected token") {
         return (
             Some("SYNTAX".into()),
             Some("the script has a shell syntax error; review quoting and line structure".into()),
