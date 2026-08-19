@@ -46,8 +46,15 @@ pub fn reset_abort() {
 /// Run a command/script and return the normalized result.
 pub fn run(spec: &ExecSpec) -> ExecResult {
     let start = Instant::now();
-    let shell = resolve_shell(spec);
-    let argv = shell_argv(shell, spec);
+    // Direct argv (toolchain runner) bypasses shell interpretation entirely.
+    let (shell, argv) = match &spec.direct {
+        Some(a) => (a.first().cloned().unwrap_or_default(), a.clone()),
+        None => {
+            let shell = resolve_shell(spec);
+            let argv = shell_argv(shell, spec);
+            (shell.as_str().to_string(), argv)
+        }
+    };
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
@@ -78,10 +85,10 @@ pub fn run(spec: &ExecSpec) -> ExecResult {
         Err(e) => {
             // Spawn failure (e.g. shell binary missing): surface as a
             // normalized result with a taxonomy class instead of panicking.
-            let mut r = ExecResult::success(String::new(), String::new(), shell.as_str());
+            let mut r = ExecResult::success(String::new(), String::new(), &shell);
             r.exit_code = None;
             r.error_class = Some("COMMAND_NOT_FOUND".into());
-            r.hint = Some(format!("could not spawn `{}`: {}", shell.as_str(), e));
+            r.hint = Some(format!("could not spawn `{}`: {}", shell, e));
             r.stderr = format!("unirun: spawn failed: {}", e);
             r.duration_ms = start.elapsed().as_millis() as u64;
             return r;
@@ -153,7 +160,7 @@ pub fn run(spec: &ExecSpec) -> ExecResult {
         hint: None,
         encoding: stdout.encoding.to_string(),
         truncated: stdout_trunc || stderr_trunc,
-        shell_used: shell.as_str().to_string(),
+        shell_used: shell,
     };
     let (class, hint) = classify(&result);
     result.error_class = class;

@@ -63,7 +63,65 @@ cd unirun && cargo build --release
 unirun run '<command>' [--timeout 30] [--shell bash] [--workdir dir] [--env K=V]
 unirun script path/to/script [options]     # shell inferred from extension
 unirun probe [--json]                      # host capability snapshot
+unirun mcp                                 # serve MCP over stdio (agents)
+unirun ssh <host> '<script>' [--shell powershell|pwsh|cmd]   # remote Windows
 ```
+
+### MCP — plug into any agent
+
+`unirun mcp` is a stdio MCP server exposing `exec.run`, `exec.script` and
+`exec.probe` (JSON-RPC 2.0, newline-delimited). Point any MCP-capable agent
+at it:
+
+```json
+// Claude Desktop / Cursor / DSH mcp config
+{ "mcpServers": { "unirun": { "command": "unirun", "args": ["mcp"] } } }
+```
+
+Tools return the normalized `ExecResult` JSON (exit_code / error_class /
+hint / encoding / truncated), with `isError` reflecting the taxonomy class.
+
+### Remote Windows execution (SSH)
+
+`unirun ssh` is the win-exec knowledge ported to Rust: UTF-16LE
+`-EncodedCommand` payloads, auto-injected UTF-8 "golden recipe" (no
+CLIXML/GBK mojibake), exact exit-code propagation via `exit $LASTEXITCODE`,
+and automatic scp + `-File` fallback for large scripts (UTF-8 BOM so Chinese
+content works). cmd.exe targets run via temp `.bat` files.
+
+### Per-project adaptation (recipes)
+
+Ship a `.unirun/recipe.toml` in a project and unirun auto-applies it
+(toolchain runners, timeouts, output caps):
+
+```toml
+schema = 1
+[toolchains.python]
+runner = "uv"
+fallbacks = ["python3", "py"]
+args = ["run"]
+
+[toolchains.node]
+runner = "pnpm"
+fallbacks = ["npm", "yarn"]
+
+[conventions]
+max_output_bytes = 262144
+
+[timeouts]
+default_ms = 30000
+
+[error_maps]
+"ModuleNotFoundError: *" = { class = "DEPENDENCY_MISSING", hint = "run `uv sync`" }
+```
+
+```bash
+unirun script main.py --toolchain python --json   # → uv run main.py
+```
+
+Capability results are cached at `.unirun/capabilities.json` with a drift
+check (platform + shell paths), so agents stop hitting "it worked yesterday".
+
 
 ### Exit-code contract (non-JSON mode)
 
@@ -97,14 +155,16 @@ confirmed pattern, so an explicit `exit 42` stays class-less (rc is the signal).
 
 ## Roadmap
 
-- **P0 (this release)** — local execution normalization: probe, in-process
+- **P0 (released)** — local execution normalization: probe, in-process
   timeout, tree kill, encoding pipeline, taxonomy, CLI `--json`.
-- **P1** — Windows local (`taskkill` tree, cmd/PS dispatch), SSH-remote
-  transport (win-exec knowledge: EncodedCommand / scp fallback / BOM /
-  exit contract), MCP server (`exec.run` / `exec.script` / `exec.probe`),
-  per-project recipe system (`.unirun/recipe.toml`, capability cache).
-- **P2** — error-map libraries, recipe registry, background sessions, ACP,
-  WinRM provider (psrp-rs POC), performance benchmarks.
+- **P1 (released)** — MCP server (`exec.run` / `exec.script` / `exec.probe`),
+  SSH-remote transport (win-exec port: EncodedCommand / scp fallback / BOM /
+  exit contract — verified against a real Windows node), per-project recipe
+  system (`.unirun/recipe.toml`, toolchain runners, capability cache),
+  Windows CI matrix.
+- **P2** — Windows local execution polish, error-map libraries, recipe
+  registry, background sessions, ACP, WinRM provider (psrp-rs POC),
+  performance benchmarks.
 
 Independent by design: MCP + CLI only, no harness dependency, no telemetry,
 MIT licensed.

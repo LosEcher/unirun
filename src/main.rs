@@ -1,4 +1,4 @@
-//! unirun CLI: `run`, `script`, `probe`.
+//! unirun CLI: `run`, `script`, `probe`, `ssh`, `mcp`.
 //!
 //! Exit-code contract (non-JSON mode):
 //!   child rc        → same rc
@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use unirun::exec::install_sigint_handler;
+use unirun::recipe::Recipe;
 use unirun::spec::{ExecKind, ExecResult, ExecSpec, Shell};
 
 const HELP: &str = "\
@@ -21,6 +22,8 @@ USAGE:
   unirun run '<command>' [options]      run a command through a shell
   unirun script <file> [options]        run a script file (shell by extension)
   unirun probe [--json]                 show host capabilities
+  unirun mcp                            serve the MCP protocol over stdio
+  unirun ssh <host> '<script>' [opts]  run a script on a remote Windows host
   unirun --version | --help
 
 OPTIONS:
@@ -28,8 +31,12 @@ OPTIONS:
   --shell <name>     bash | sh | zsh | cmd | powershell | pwsh
   --workdir <dir>    working directory
   --env K=V          environment override (repeatable)
+  --toolchain <name> run via a recipe toolchain runner (e.g. python -> uv run)
   --json             emit the normalized result as JSON (agent mode)
   --pretty           pretty-print JSON (implies --json)
+
+Projects may ship a `.unirun/recipe.toml`; run/script auto-apply its
+timeout and output conventions, and `--toolchain` resolves its runners.
 ";
 
 fn main() -> ExitCode {
@@ -54,6 +61,14 @@ fn main() -> ExitCode {
         "run" => cmd_run(&args[1..]),
         "script" => cmd_script(&args[1..]),
         "probe" => cmd_probe(&args[1..]),
+        "ssh" => cmd_ssh(&args[1..]),
+        "mcp" => {
+            if let Err(e) = unirun::mcp::serve() {
+                eprintln!("unirun mcp: {}", e);
+                return ExitCode::from(1);
+            }
+            ExitCode::SUCCESS
+        }
         other => {
             eprintln!("unirun: unknown subcommand `{}`", other);
             eprintln!("{}", HELP);
@@ -68,6 +83,7 @@ struct CliOpts {
     shell: Option<Shell>,
     workdir: Option<PathBuf>,
     env: Vec<(String, String)>,
+    toolchain: Option<String>,
     json: bool,
     pretty: bool,
 }
@@ -109,6 +125,11 @@ fn parse_flags(args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, Strin
                 let (k, val) = v.split_once('=').ok_or("--env must be K=V")?;
                 opts.env.push((k.to_string(), val.to_string()));
             }
+            "--toolchain" => {
+                i += 1;
+                let v = args.get(i).ok_or("--toolchain needs a value")?;
+                opts.toolchain = Some(v.clone());
+            }
             _ => positional.push(a.clone()),
         }
         i += 1;
@@ -117,7 +138,7 @@ fn parse_flags(args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, Strin
 }
 
 fn build_spec(command: String, kind: ExecKind, opts: &CliOpts) -> ExecSpec {
-    ExecSpec {
+    let mut spec = ExecSpec {
         command,
         kind,
         shell: opts.shell,
@@ -125,7 +146,39 @@ fn build_spec(command: String, kind: ExecKind, opts: &CliOpts) -> ExecSpec {
         env: opts.env.clone(),
         timeout_ms: opts.timeout_sec.map(|s| s * 1000).unwrap_or(0),
         ..Default::default()
+    };
+    // Per-project adaptation: auto-apply recipe defaults when the caller did
+    // not override them.
+    let base = opts
+        .workdir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    if let Some(recipe) = Recipe::load_from_dir(&base) {
+        if spec.timeout_ms == 0 {
+            if let Some(t) = recipe.default_timeout_ms() {
+                spec.timeout_ms = t;
+            }
+        }
+        if spec.max_output_bytes == 0 {
+            if let Some(m) = recipe.max_output_bytes() {
+                spec.max_output_bytes = m as usize;
+            }
+        }
     }
+    spec
+}
+
+/// Resolve a recipe toolchain to a direct argv (`runner args… <file>`).
+fn toolchain_argv(recipe: &Recipe, name: &str, file: &str) -> Result<Vec<String>, String> {
+    recipe
+        .resolve_toolchain(name)
+        .map(|(runner, args)| {
+            let mut argv = vec![runner];
+            argv.extend(args);
+            argv.push(file.to_string());
+            argv
+        })
+        .ok_or_else(|| format!("toolchain `{}` not resolvable on this host", name))
 }
 
 fn emit(result: &ExecResult, opts: &CliOpts, pretty: bool) -> ExitCode {
@@ -207,8 +260,54 @@ fn cmd_script(args: &[String]) -> ExitCode {
     if opts.shell.is_none() {
         opts.shell = Shell::from_path(PathBuf::from(path).as_path());
     }
-    let spec = build_spec(content, ExecKind::Script, &opts);
+    let mut spec = build_spec(content, ExecKind::Script, &opts);
+    // --toolchain: run through a recipe runner instead of a shell.
+    if let Some(tc) = &opts.toolchain {
+        let base = opts
+            .workdir
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let recipe = Recipe::load_from_dir(&base).unwrap_or_default();
+        match toolchain_argv(&recipe, tc, path) {
+            Ok(argv) => {
+                spec.direct = Some(argv);
+                spec.command.clear();
+            }
+            Err(e) => {
+                eprintln!("unirun: {}", e);
+                return ExitCode::from(2);
+            }
+        }
+    }
     let result = unirun::run(&spec);
+    emit(&result, &opts, opts.pretty)
+}
+
+fn cmd_ssh(args: &[String]) -> ExitCode {
+    let mut opts = CliOpts::default();
+    let positional = match parse_flags(args, &mut opts) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("unirun: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+    if positional.len() < 2 {
+        eprintln!("unirun ssh: usage: unirun ssh <host> '<script>' [--shell powershell|pwsh|cmd] [--timeout N]");
+        return ExitCode::from(2);
+    }
+    let mut target = unirun::SshTarget {
+        host: positional[0].clone(),
+        ..Default::default()
+    };
+    if let Some(s) = opts.shell {
+        target.shell = s;
+    }
+    if let Some(t) = opts.timeout_sec {
+        target.timeout_ms = t * 1000;
+    }
+    let script = positional[1..].join(" ");
+    let result = unirun::ssh_run(&target, &script);
     emit(&result, &opts, opts.pretty)
 }
 

@@ -3,24 +3,24 @@
 //! I rely on here?" before it picks a strategy. This is the probe half of
 //! the probe-then-degrade pattern.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A tool found (or not) on PATH.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInfo {
-    pub name: &'static str,
+    pub name: String,
     pub path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellInfo {
-    pub name: &'static str,
+    pub name: String,
     pub path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreutilsInfo {
     /// `timeout` (GNU coreutils) — absent on stock macOS/BSD.
     pub timeout: Option<String>,
@@ -30,7 +30,7 @@ pub struct CoreutilsInfo {
     pub gnu_timeout_available: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capabilities {
     pub platform: String,
     pub arch: String,
@@ -70,7 +70,7 @@ pub fn probe() -> Capabilities {
     let shells = shell_names
         .iter()
         .map(|n| ShellInfo {
-            name: n,
+            name: (*n).to_string(),
             path: which(n),
         })
         .collect();
@@ -86,7 +86,7 @@ pub fn probe() -> Capabilities {
     let tools = tool_names
         .iter()
         .map(|n| ToolInfo {
-            name: n,
+            name: (*n).to_string(),
             path: which(n),
         })
         .collect();

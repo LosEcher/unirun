@@ -86,6 +86,10 @@ pub struct ExecSpec {
     /// Per-stream output cap in bytes; `0` → `DEFAULT_MAX_OUTPUT_BYTES`.
     /// Overflow is drained (no pipe deadlock) and marked `truncated`.
     pub max_output_bytes: usize,
+    /// Exact argv to execute directly (no shell). When set, bypasses
+    /// `shell`/`command` interpretation — used by toolchain runners
+    /// (e.g. `["uv", "run", "script.py"]`).
+    pub direct: Option<Vec<String>>,
 }
 
 impl Default for ExecSpec {
@@ -99,6 +103,7 @@ impl Default for ExecSpec {
             timeout_ms: 0,
             grace_ms: 0,
             max_output_bytes: 0,
+            direct: None,
         }
     }
 }

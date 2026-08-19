@@ -6,10 +6,14 @@
 
 pub mod encoding;
 pub mod exec;
+pub mod mcp;
 pub mod probe;
+pub mod recipe;
 pub mod spec;
 pub mod taxonomy;
+pub mod transport;
 
 pub use exec::{install_sigint_handler, reset_abort, run};
 pub use probe::{probe, Capabilities};
 pub use spec::{ExecKind, ExecResult, ExecSpec, Shell};
+pub use transport::{ssh_run, SshTarget};
