@@ -5,7 +5,7 @@ edition = "2021"
 description = "Cross-platform command execution normalization for AI agents — one command spec in, one normalized result out, on any platform."
 license = "MIT"
 repository = "https://github.com/LosEcher/unirun"
-keywords = ["exec", "cross-platform", "agent", "mcp", "shell", "normalization"]
+keywords = ["exec", "cross-platform", "agent", "mcp", "normalization"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
