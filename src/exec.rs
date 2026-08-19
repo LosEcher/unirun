@@ -195,7 +195,14 @@ fn resolve_shell(spec: &ExecSpec) -> Shell {
 }
 
 fn default_posix_shell() -> Shell {
-    if which("bash").is_some() {
+    if cfg!(windows) {
+        // Windows has no bash/sh by default: PowerShell if present, else cmd.
+        if which("powershell").is_some() || which("pwsh").is_some() {
+            Shell::Powershell
+        } else {
+            Shell::Cmd
+        }
+    } else if which("bash").is_some() {
         Shell::Bash
     } else {
         Shell::Sh

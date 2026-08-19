@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! P0 acceptance matrix — the win-exec A–L empirical matrix (2026-08-18),
 //! ported to local POSIX semantics, plus the P0-specific guarantees:
 //! timeout, whole-tree kill, tail truncation, taxonomy, encoding.

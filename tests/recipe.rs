@@ -1,5 +1,8 @@
+#![cfg(unix)]
 //! Recipe system integration: toolchain direct execution, CLI default
 //! application (max_output/timeout), and --toolchain runner resolution.
+//! (POSIX-oriented: relies on seq/python3/bash semantics; Windows local
+//! execution semantics are covered separately.)
 
 use std::io::Write;
 use std::process::{Command, Stdio};
