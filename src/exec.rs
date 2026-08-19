@@ -22,6 +22,7 @@ use crate::taxonomy::classify_with_maps;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,8 +44,51 @@ pub fn reset_abort() {
     ABORT.store(false, Ordering::SeqCst);
 }
 
-/// Run a command/script and return the normalized result.
+/// Which stream a chunk came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
+/// One decoded output chunk (incremental UTF-8, CRLF normalized).
+#[derive(Debug, Clone)]
+pub struct StreamChunk {
+    pub stream: StreamKind,
+    pub text: String,
+}
+
+/// Run a command/script and return the normalized result (buffered).
 pub fn run(spec: &ExecSpec) -> ExecResult {
+    run_inner(spec, &ABORT, None)
+}
+
+/// Run and stream decoded output chunks as they arrive. `tx` receives
+/// `StreamChunk`s (per-stream, incremental UTF-8 decoding, CRLF normalized);
+/// the returned `ExecResult` is identical to `run`'s (same tail-keeping,
+/// same classification). Use for live tails (background sessions) and
+/// protocol streaming (ACP). When the receiver is dropped, streaming silently
+/// degrades to buffered mode.
+pub fn run_streaming(spec: &ExecSpec, tx: mpsc::Sender<StreamChunk>) -> ExecResult {
+    run_inner(spec, &ABORT, Some(tx))
+}
+
+/// Streaming variant with a caller-owned abort flag (per-session cancel,
+/// e.g. ACP `session/cancel`).
+pub(crate) fn run_with_abort_streaming(
+    spec: &ExecSpec,
+    abort: &AtomicBool,
+    tx: Option<mpsc::Sender<StreamChunk>>,
+) -> ExecResult {
+    run_inner(spec, abort, tx)
+}
+
+/// Run a command/script and return the normalized result.
+fn run_inner(
+    spec: &ExecSpec,
+    abort: &AtomicBool,
+    tx: Option<mpsc::Sender<StreamChunk>>,
+) -> ExecResult {
     let start = Instant::now();
     // Direct argv (toolchain runner) bypasses shell interpretation entirely.
     let (shell, argv) = match &spec.direct {
@@ -96,14 +140,14 @@ pub fn run(spec: &ExecSpec) -> ExecResult {
     };
 
     let max = spec.effective_max_output();
-    let stdout_thread = child
-        .stdout
-        .take()
-        .map(|s| thread::spawn(move || read_capped(s, max)));
+    let stdout_thread = child.stdout.take().map(|s| {
+        let tx = tx.clone();
+        thread::spawn(move || read_capped_maybe_stream(s, max, StreamKind::Stdout, tx))
+    });
     let stderr_thread = child
         .stderr
         .take()
-        .map(|s| thread::spawn(move || read_capped(s, max)));
+        .map(|s| thread::spawn(move || read_capped_maybe_stream(s, max, StreamKind::Stderr, tx)));
 
     let timeout = Duration::from_millis(spec.effective_timeout_ms());
     let grace = Duration::from_millis(spec.effective_grace_ms());
@@ -121,7 +165,7 @@ pub fn run(spec: &ExecSpec) -> ExecResult {
                 break;
             }
             Ok(None) => {
-                if ABORT.load(Ordering::SeqCst) {
+                if abort.load(Ordering::SeqCst) {
                     aborted = true;
                     #[cfg(unix)]
                     kill_tree(&mut child, grace);
@@ -259,11 +303,17 @@ struct Captured {
 /// Read a stream to EOF, keeping only the **tail** `max` bytes but draining
 /// the rest so the child never blocks on a full pipe. Errors and results
 /// cluster at the end of output, so the tail is the diagnostic part agents
-/// actually need.
-fn read_capped<R: Read>(mut reader: R, max: usize) -> Captured {
+/// actually need. When `tx` is `Some`, decoded chunks are streamed live.
+fn read_capped_maybe_stream<R: Read>(
+    mut reader: R,
+    max: usize,
+    kind: StreamKind,
+    tx: Option<mpsc::Sender<StreamChunk>>,
+) -> Captured {
     let mut tail: Vec<u8> = Vec::with_capacity(max.saturating_add(8192));
     let mut total: usize = 0;
     let mut chunk = [0u8; 8192];
+    let mut dec = tx.as_ref().map(|_| IncrementalDecoder::new());
     loop {
         match reader.read(&mut chunk) {
             Ok(0) => break,
@@ -274,13 +324,94 @@ fn read_capped<R: Read>(mut reader: R, max: usize) -> Captured {
                     let excess = tail.len() - max;
                     tail.drain(..excess);
                 }
+                if let Some(d) = &mut dec {
+                    let text = d.push(&chunk[..n]);
+                    if !text.is_empty() {
+                        let _ = tx.as_ref().unwrap().send(StreamChunk {
+                            stream: kind,
+                            text: crate::encoding::normalize_line_endings(&text),
+                        });
+                    }
+                }
             }
             Err(_) => break,
+        }
+    }
+    if let Some(d) = &mut dec {
+        let rest = d.finish();
+        if !rest.is_empty() {
+            let _ = tx.as_ref().unwrap().send(StreamChunk {
+                stream: kind,
+                text: crate::encoding::normalize_line_endings(&rest),
+            });
         }
     }
     Captured {
         bytes: tail,
         truncated: total > max,
+    }
+}
+
+/// Incremental UTF-8 decoder: emits valid text per push and carries an
+/// incomplete trailing sequence (≤3 bytes) to the next push. Invalid bytes
+/// are replaced with U+FFFD (the stream is labeled lossy by the caller via
+/// the final `ExecResult` encoding when the buffered decode detects it).
+struct IncrementalDecoder {
+    buf: Vec<u8>,
+    lossy: bool,
+}
+
+impl IncrementalDecoder {
+    fn new() -> Self {
+        IncrementalDecoder {
+            buf: Vec::with_capacity(8),
+            lossy: false,
+        }
+    }
+
+    /// Decode `bytes`; return the text completed so far. Anything that could
+    /// still be the head of a multi-byte sequence is carried over.
+    fn push(&mut self, bytes: &[u8]) -> String {
+        self.buf.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.buf) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.buf.clear();
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        // Safety: from_utf8 verified `valid` bytes are valid.
+                        out.push_str(unsafe { std::str::from_utf8_unchecked(&self.buf[..valid]) });
+                        self.buf.drain(..valid);
+                        continue;
+                    }
+                    match e.error_len() {
+                        Some(n) => {
+                            self.lossy = true;
+                            out.push('\u{FFFD}');
+                            self.buf.drain(..n);
+                        }
+                        None => break, // incomplete tail: wait for more bytes
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Flush whatever is still buffered (lossy).
+    fn finish(&mut self) -> String {
+        if self.buf.is_empty() {
+            return String::new();
+        }
+        self.lossy = true;
+        let out = String::from_utf8_lossy(&self.buf).into_owned();
+        self.buf.clear();
+        out
     }
 }
 
@@ -338,4 +469,87 @@ fn signal_of(status: &std::process::ExitStatus) -> Option<i32> {
 #[cfg(windows)]
 fn signal_of(_status: &std::process::ExitStatus) -> Option<i32> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::ExecSpec;
+
+    fn sh_ok(command: &str) -> ExecSpec {
+        ExecSpec {
+            command: command.to_string(),
+            shell: Some(Shell::Bash),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn incremental_decoder_splits_multibyte_across_pushes() {
+        let mut d = IncrementalDecoder::new();
+        let bytes = "中文".as_bytes(); // 6 bytes: E4 B8 AD | E6 96 87
+        let a = d.push(&bytes[..5]); // cut in the middle of 文's lead
+        assert_eq!(a, "中");
+        let b = d.push(&bytes[5..]);
+        assert_eq!(b, "文");
+        assert_eq!(d.finish(), "");
+    }
+
+    #[test]
+    fn incremental_decoder_replaces_invalid_bytes() {
+        let mut d = IncrementalDecoder::new();
+        let out = d.push(b"ok\xFF\xFEnope");
+        assert!(out.contains('\u{FFFD}'));
+        assert!(out.contains("ok"));
+        assert!(out.contains("nope"));
+    }
+
+    #[test]
+    fn incremental_decoder_flushes_incomplete_tail_lossily() {
+        let mut d = IncrementalDecoder::new();
+        assert_eq!(d.push(&[0xE4]), ""); // incomplete lead byte
+        let rest = d.finish();
+        assert!(rest.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn run_streaming_matches_run_and_splits_streams() {
+        if which("bash").is_none() {
+            return; // windows CI images without bash
+        }
+        let spec = sh_ok("printf 'abc'; printf '中文'; echo boom >&2");
+        let buffered = run(&spec);
+        assert_eq!(buffered.exit_code, Some(0));
+        assert_eq!(buffered.stdout, "abc中文");
+
+        let (tx, rx) = mpsc::channel();
+        let streamed = run_streaming(&spec, tx);
+        let chunks: Vec<StreamChunk> = rx.try_iter().collect();
+        let stdout_all: String = chunks
+            .iter()
+            .filter(|c| c.stream == StreamKind::Stdout)
+            .map(|c| c.text.as_str())
+            .collect();
+        let stderr_all: String = chunks
+            .iter()
+            .filter(|c| c.stream == StreamKind::Stderr)
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(stdout_all, buffered.stdout);
+        assert!(stderr_all.contains("boom"));
+        assert_eq!(streamed.stdout, buffered.stdout);
+        assert_eq!(streamed.exit_code, buffered.exit_code);
+        assert_eq!(streamed.error_class, buffered.error_class);
+    }
+
+    #[test]
+    fn run_with_custom_abort_flag_reports_aborted() {
+        if which("bash").is_none() {
+            return;
+        }
+        let abort = AtomicBool::new(true); // pre-set: run must abort immediately
+        let r = run_with_abort_streaming(&sh_ok("sleep 5"), &abort, None);
+        assert!(r.aborted);
+        assert_eq!(r.error_class.as_deref(), Some("ABORTED"));
+    }
 }
