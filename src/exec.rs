@@ -222,11 +222,16 @@ fn shell_argv(shell: Shell, spec: &ExecSpec) -> Vec<String> {
             ]
         }
         Shell::Pwsh | Shell::Powershell => {
+            // Local PowerShell: inject the UTF-8 "golden recipe" so stdout and
+            // stderr are clean UTF-8 instead of CLIXML/OEM mojibake — the same
+            // normalization the SSH transport applies remotely. The recipe is
+            // output-only; the command's own exit semantics are untouched.
+            let recipe = "$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8;";
             vec![
                 shell.as_str().to_string(),
                 "-NoProfile".into(),
                 "-Command".into(),
-                spec.command.clone(),
+                format!("{} {}", recipe, spec.command),
             ]
         }
         Shell::Cmd => {
