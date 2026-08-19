@@ -40,8 +40,11 @@ pub struct Capabilities {
 }
 
 /// Resolve a command to its absolute path by scanning PATH, or `None`.
+/// On Windows, executable extensions (`.exe/.cmd/.bat/.ps1`) are probed
+/// because `cmd` exists as `cmd.exe` (CreateProcess resolves extensions,
+/// but a PATH file-scan must do so explicitly).
 pub fn which(name: &str) -> Option<String> {
-    if name.contains('/') {
+    if name.contains('/') || name.contains('\\') {
         let p = Path::new(name);
         return if p.is_file() {
             Some(p.to_string_lossy().into_owned())
@@ -50,12 +53,26 @@ pub fn which(name: &str) -> Option<String> {
         };
     }
     for dir in path_entries() {
-        let cand = dir.join(name);
-        if cand.is_file() {
-            return Some(cand.to_string_lossy().into_owned());
+        for cand_name in executable_candidates(name) {
+            let cand = dir.join(&cand_name);
+            if cand.is_file() {
+                return Some(cand.to_string_lossy().into_owned());
+            }
         }
     }
     None
+}
+
+/// Candidate filenames for a bare command name, platform-aware.
+fn executable_candidates(name: &str) -> Vec<String> {
+    let mut v = vec![name.to_string()];
+    if cfg!(windows) && !name.contains('.') {
+        v.push(format!("{}.exe", name));
+        v.push(format!("{}.cmd", name));
+        v.push(format!("{}.bat", name));
+        v.push(format!("{}.ps1", name));
+    }
+    v
 }
 
 fn path_entries() -> Vec<PathBuf> {
