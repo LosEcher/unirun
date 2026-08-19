@@ -123,13 +123,19 @@ pub fn run(spec: &ExecSpec) -> ExecResult {
             Ok(None) => {
                 if ABORT.load(Ordering::SeqCst) {
                     aborted = true;
+                    #[cfg(unix)]
                     kill_tree(&mut child, grace);
+                    #[cfg(windows)]
+                    kill_tree(&child, grace);
                     let _ = child.wait();
                     break;
                 }
                 if start.elapsed() >= timeout {
                     timed_out = true;
+                    #[cfg(unix)]
                     kill_tree(&mut child, grace);
+                    #[cfg(windows)]
+                    kill_tree(&child, grace);
                     let _ = child.wait();
                     break;
                 }

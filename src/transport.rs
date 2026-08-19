@@ -164,7 +164,10 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str) -> ExecResult {
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     timed_out = true;
+                    #[cfg(unix)]
                     kill_ssh_tree(&mut child, grace);
+                    #[cfg(windows)]
+                    kill_ssh_tree(&child, grace);
                     let _ = child.wait();
                     break;
                 }
