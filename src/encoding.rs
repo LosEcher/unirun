@@ -53,15 +53,42 @@ pub fn decode(bytes: &[u8]) -> Decoded {
         };
     }
     match std::str::from_utf8(bytes) {
-        Ok(s) => Decoded {
-            text: s.to_string(),
-            encoding: "utf-8",
-        },
+        Ok(s) => {
+            // UTF-16LE without BOM (e.g. the WSL launcher's "no installed
+            // distributions" message) is *valid* UTF-8 full of NULs — detect
+            // the NUL pattern and decode it properly instead of handing the
+            // agent NUL-garbage labeled "utf-8".
+            if looks_utf16le_without_bom(bytes) {
+                Decoded {
+                    text: decode_utf16(bytes, true),
+                    encoding: "utf-16le",
+                }
+            } else {
+                Decoded {
+                    text: s.to_string(),
+                    encoding: "utf-8",
+                }
+            }
+        }
         Err(_) => Decoded {
             text: String::from_utf8_lossy(bytes).into_owned(),
             encoding: "utf-8-lossy",
         },
     }
+}
+
+/// BOM-less UTF-16LE heuristic: even byte count with NULs at (at least two)
+/// odd byte positions — the signature of ASCII-range UTF-16LE text.
+fn looks_utf16le_without_bom(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 || !bytes.len().is_multiple_of(2) {
+        return false;
+    }
+    let nul_at_odd = bytes
+        .iter()
+        .enumerate()
+        .filter(|(i, b)| i % 2 == 1 && **b == 0)
+        .count();
+    nul_at_odd >= 2
 }
 
 fn decode_utf16(units: &[u8], little_endian: bool) -> String {
@@ -150,5 +177,26 @@ mod tests {
         v.extend_from_slice(&0xDE00u16.to_le_bytes());
         let d = decode(&v);
         assert_eq!(d.text, "😀");
+    }
+
+    #[test]
+    fn bomless_utf16le_detected_by_nul_pattern() {
+        // WSL launcher output: UTF-16LE without BOM, *valid* UTF-8 with NULs.
+        let msg = "Windows Subsystem for Linux has no installed distributions";
+        let mut bytes = Vec::new();
+        for u in msg.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let d = decode(&bytes);
+        assert_eq!(d.text, msg);
+        assert_eq!(d.encoding, "utf-16le");
+    }
+
+    #[test]
+    fn plain_utf8_with_single_nul_stays_utf8() {
+        // `printf 'a\0b'` — odd length, not a UTF-16 stream.
+        let d = decode(b"a\0b");
+        assert_eq!(d.encoding, "utf-8");
+        assert!(d.text.contains('\0'));
     }
 }

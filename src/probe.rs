@@ -56,11 +56,38 @@ pub fn which(name: &str) -> Option<String> {
         for cand_name in executable_candidates(name) {
             let cand = dir.join(&cand_name);
             if cand.is_file() {
+                if is_wsl_bash_shim(&cand) {
+                    // Windows: %SystemRoot%\System32\bash.exe is the WSL
+                    // launcher, not a usable bash — with no distro installed
+                    // it prints a UTF-16LE "no distributions" message and
+                    // exits 1. Treat it as absent so probe/recipes/tests
+                    // never route through it (Git Bash lives elsewhere).
+                    continue;
+                }
                 return Some(cand.to_string_lossy().into_owned());
             }
         }
     }
     None
+}
+
+/// `System32\bash.exe` on Windows is always the WSL shim.
+fn is_wsl_bash_shim(path: &Path) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name != "bash.exe" {
+        return false;
+    }
+    let sys = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    path.starts_with(sys.join("System32"))
 }
 
 /// Candidate filenames for a bare command name, platform-aware.
@@ -170,5 +197,17 @@ mod tests {
         if cfg!(unix) {
             assert!(which("sh").is_some());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_bash_shim_is_excluded() {
+        // System32\bash.exe (WSL launcher) must never resolve as bash; Git
+        // Bash lives under Program Files.
+        let sys = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let shim = PathBuf::from(&sys).join("System32").join("bash.exe");
+        assert!(is_wsl_bash_shim(&shim), "{:?}", shim);
+        let git_bash = PathBuf::from(r"C:\Program Files\Git\bin\bash.exe");
+        assert!(!is_wsl_bash_shim(&git_bash));
     }
 }
