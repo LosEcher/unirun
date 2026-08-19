@@ -525,7 +525,11 @@ mod tests {
         }
         let spec = sh_ok("printf 'abc'; printf '中文'; echo boom >&2");
         let buffered = run(&spec);
-        assert_eq!(buffered.exit_code, Some(0));
+        assert_eq!(
+            buffered.exit_code, Some(0),
+            "buffered result: {:?}",
+            buffered
+        );
         assert_eq!(buffered.stdout, "abc中文");
 
         let (tx, rx) = mpsc::channel();
