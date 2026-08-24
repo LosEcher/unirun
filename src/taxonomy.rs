@@ -7,6 +7,10 @@
 //!   TIMEOUT · ABORTED · COMMAND_NOT_FOUND · PERMISSION · EXEC_FORMAT
 //!   NOT_FOUND · DEPENDENCY_MISSING · SYNTAX · UNKNOWN_FAILURE
 //!   NETWORK · COMPILE_ERROR          (added with the P2 error-map library)
+//!   PID_REUSED                       (kill refused — pid no longer refers to
+//!                                    the process this run spawned; set
+//!                                    directly by the kill path, never
+//!                                    inferred from output evidence)
 //!
 //! Matching order (first hit wins):
 //!   1. structural cases handled here (timeout / abort / POSIX exit codes)

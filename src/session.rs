@@ -16,6 +16,7 @@
 //!
 //! Storage root: `$UNIRUN_HOME/sessions` (default `~/.unirun/sessions`).
 
+use crate::process_identity::{self, ExpectedIdentity, IdentityVerdict};
 use crate::recipe::unirun_home;
 use crate::spec::{ExecResult, ExecSpec, Shell};
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,16 @@ pub struct SessionSpec {
     pub shell: Option<String>,
     pub workdir: Option<String>,
     pub timeout_ms: u64,
+}
+
+/// The runner's process identity at spawn (sidecar `identity.json`), used by
+/// `kill` to refuse killing a recycled pid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionIdentity {
+    pub pid: u32,
+    pub generation_token: String,
+    pub start_epoch_ms: Option<u64>,
+    pub token_observable: bool,
 }
 
 impl SessionState {
@@ -115,9 +126,13 @@ pub fn start(spec: &ExecSpec, label: &str) -> Result<SessionState, String> {
     let exe = std::env::var_os("UNIRUN_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_exe().unwrap_or_default());
+    // Generation token for the runner's own identity: `bg kill` verifies the
+    // stored pid still carries it before signalling (anti pid-reuse).
+    let generation_token = process_identity::generate_generation_token();
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("__bg-runner")
         .arg(&dir)
+        .env(process_identity::GENERATION_TOKEN_ENV, &generation_token)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -160,6 +175,18 @@ pub fn start(spec: &ExecSpec, label: &str) -> Result<SessionState, String> {
     });
     st.pid = Some(child.id());
     write_json(&dir.join("state.json"), &st).map_err(|e| format!("cannot write state: {}", e))?;
+
+    // Record the runner's identity at spawn so `kill` can refuse a recycled
+    // pid. The runner's argv is `unirun __bg-runner <dir>` — the token lives
+    // in its env, which unix exposes (`/proc`/`ps eww`) but Windows does not.
+    let identity = SessionIdentity {
+        pid: child.id(),
+        generation_token: generation_token.clone(),
+        start_epoch_ms: process_identity::read_start_epoch_ms(child.id()),
+        token_observable: cfg!(not(windows)),
+    };
+    write_json(&dir.join("identity.json"), &identity)
+        .map_err(|e| format!("cannot write identity: {}", e))?;
     Ok(st)
 }
 
@@ -304,12 +331,47 @@ pub fn output(id: &str, tail_bytes: usize) -> Result<(String, String, bool), Str
 /// Kill a running session: SIGTERM the runner (POSIX) / taskkill the tree
 /// (Windows), wait briefly for the runner to record a terminal state, then
 /// force-mark `killed` if it did not.
+///
+/// Before signalling, the stored runner identity (generation token + start
+/// epoch, captured at spawn) is verified: a stale session whose runner pid
+/// was recycled must not kill an innocent process — the kill is refused with
+/// a `PID_REUSED` classification. Sessions started before identity tracking
+/// (no `identity.json`) keep the legacy unverified behavior.
 pub fn kill(id: &str) -> Result<SessionState, String> {
-    let st = status(id)?;
+    let mut st = status(id)?;
     if st.is_terminal() {
         return Ok(st);
     }
     let pid = st.pid.ok_or("session has no runner pid")?;
+
+    if let Some(identity) = load_identity(id)? {
+        let expected = ExpectedIdentity {
+            pid,
+            generation_token: identity.generation_token,
+            start_epoch_ms: identity.start_epoch_ms,
+            token_observable: identity.token_observable,
+        };
+        let verdict =
+            process_identity::verify(&expected, process_identity::IDENTITY_EPOCH_TOLERANCE_MS);
+        match &verdict {
+            IdentityVerdict::Matches => {}
+            IdentityVerdict::NotRunning => {
+                // Runner already gone (exited or zombie): mark interrupted.
+                st.status = "interrupted".into();
+                st.finished_at = Some(now_millis());
+                write_json(&session_dir(id).join("state.json"), &st)?;
+                return Ok(st);
+            }
+            IdentityVerdict::StartEpochMismatch { .. } | IdentityVerdict::TokenMismatch => {
+                return Err(format!(
+                    "refusing to kill session {}: PID_REUSED — {}",
+                    id,
+                    verdict.describe()
+                ));
+            }
+        }
+    }
+
     #[cfg(unix)]
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
@@ -392,6 +454,19 @@ fn load_state(id: &str) -> Result<SessionState, String> {
     serde_json::from_str(&text).map_err(|e| format!("session `{}` state corrupt: {}", id, e))
 }
 
+/// The runner identity sidecar, if present (sessions started before identity
+/// tracking have none and keep the legacy kill behavior).
+fn load_identity(id: &str) -> Result<Option<SessionIdentity>, String> {
+    let path = session_dir(id).join("identity.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| format!("session `{}` identity corrupt: {}", id, e))
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     let text = serde_json::to_string(value).map_err(|e| e.to_string())?;
@@ -445,18 +520,9 @@ fn now_millis() -> u64 {
 }
 
 fn pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(windows)]
-    {
-        // No FFI surface for OpenProcess without a windows-sys dependency:
-        // treat unknown pids as alive so stale-detection degrades to
-        // "running" (bg kill still works via taskkill /T /F).
-        let _ = pid;
-        true
-    }
+    // Zombie-aware: a zombie has already exited and its pid is one step from
+    // reuse, so it must not keep a session marked "running".
+    process_identity::is_alive(pid)
 }
 
 #[cfg(test)]
@@ -502,6 +568,87 @@ mod tests {
         let home = temp_home("dir");
         std::env::set_var("UNIRUN_HOME", &home);
         assert_eq!(sessions_dir(), home.join("sessions"));
+        std::env::remove_var("UNIRUN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn kill_refuses_recycled_identity() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = temp_home("killreuse");
+        std::env::set_var("UNIRUN_HOME", &home);
+        // Fake a "running" session whose identity points at OUR live process
+        // with a foreign token: kill must refuse (PID_REUSED) instead of
+        // signalling an innocent pid.
+        let id = "fakesession".to_string();
+        let dir = session_dir(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = SessionState {
+            id: id.clone(),
+            label: "fake".into(),
+            status: "running".into(),
+            pid: Some(std::process::id()),
+            started_at: now_millis(),
+            finished_at: None,
+            exit_code: None,
+            error_class: None,
+            hint: None,
+            truncated: false,
+            truncated_log: false,
+            duration_ms: 0,
+            encoding: String::new(),
+            shell_used: String::new(),
+        };
+        write_json(&dir.join("state.json"), &state).unwrap();
+        write_json(
+            &dir.join("identity.json"),
+            &SessionIdentity {
+                pid: std::process::id(),
+                generation_token: "ur-not-ours".into(),
+                start_epoch_ms: None,
+                token_observable: true,
+            },
+        )
+        .unwrap();
+        let err = kill(&id).unwrap_err();
+        assert!(err.contains("PID_REUSED"), "err: {}", err);
+        // The innocent process must still be alive (kill was refused).
+        assert!(process_identity::is_alive(std::process::id()));
+        std::env::remove_var("UNIRUN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn kill_marks_not_running_session_interrupted() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = temp_home("killgone");
+        std::env::set_var("UNIRUN_HOME", &home);
+        let id = "gonesession".to_string();
+        let dir = session_dir(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = SessionState {
+            id: id.clone(),
+            label: "fake".into(),
+            status: "running".into(),
+            pid: Some(999_999_999), // certainly gone
+            started_at: now_millis(),
+            finished_at: None,
+            exit_code: None,
+            error_class: None,
+            hint: None,
+            truncated: false,
+            truncated_log: false,
+            duration_ms: 0,
+            encoding: String::new(),
+            shell_used: String::new(),
+        };
+        write_json(&dir.join("state.json"), &state).unwrap();
+        let st = kill(&id).unwrap();
+        assert_eq!(st.status, "interrupted", "state: {:?}", st);
         std::env::remove_var("UNIRUN_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

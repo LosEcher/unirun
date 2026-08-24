@@ -1,5 +1,6 @@
 //! Core data structures: execution spec in, normalized result out.
 
+use crate::coalesce::CoalescePolicy;
 use crate::recipe::ErrorMapEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -92,6 +93,11 @@ pub struct ExecSpec {
     /// `shell`/`command` interpretation — used by toolchain runners
     /// (e.g. `["uv", "run", "script.py"]`).
     pub direct: Option<Vec<String>>,
+    /// Output coalescing for streaming consumers (`run_streaming`): adjacent
+    /// same-stream chunks are merged and forwarded on a byte threshold /
+    /// timer. Only affects forwarding timing, never content or the result.
+    /// Default: enabled (128 KiB / 100 ms; stderr stays real-time).
+    pub coalesce: CoalescePolicy,
     /// Project recipe `[error_maps]` patterns, consulted before the built-in
     /// error-map library during classification (project knowledge wins).
     pub error_maps: BTreeMap<String, ErrorMapEntry>,
@@ -109,6 +115,7 @@ impl Default for ExecSpec {
             grace_ms: 0,
             max_output_bytes: 0,
             direct: None,
+            coalesce: CoalescePolicy::default(),
             error_maps: BTreeMap::new(),
         }
     }

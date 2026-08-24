@@ -45,6 +45,16 @@ unirun makes this matrix a solved, tested, shared problem:
   kept and marked `truncated` — errors cluster at the end.
 - **SIGINT = abort** — an in-flight process tree is terminated and the result
   reports `aborted: true` (agent-safe retry).
+- **Output coalescing** — streamed stdout chunks are merged into batches and
+  forwarded on a 128 KiB byte threshold or a 100 ms timer (stderr stays
+  real-time), cutting downstream forwarding overhead without changing content
+  or exit codes. `--no-coalesce` disables it.
+- **Anti pid-reuse kill protection** — every child carries a random generation
+  token (in its command line and environment) and its start time is
+  snapshotted; before terminating a process tree unirun verifies the pid still
+  refers to that exact process. A recycled pid is refused (classified
+  `PID_REUSED`) instead of mis-killing an innocent process, and zombies are
+  treated as already gone.
 - **`unirun probe`** — the agent's first question answered: what shells,
   coreutils and tools actually exist here.
 
@@ -95,7 +105,7 @@ cd unirun && cargo build --release
 ## Usage
 
 ```bash
-unirun run '<command>' [--timeout 30] [--shell bash] [--workdir dir] [--env K=V]
+unirun run '<command>' [--timeout 30] [--shell bash] [--workdir dir] [--env K=V] [--no-coalesce]
 unirun script path/to/script [options]     # shell inferred from extension
 unirun probe [--json]                      # host capability snapshot
 unirun mcp                                 # serve MCP over stdio (agents)

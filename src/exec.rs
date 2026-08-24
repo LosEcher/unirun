@@ -15,8 +15,10 @@
 //!   loop; an in-flight tree is terminated and the result reports
 //!   `aborted: true` (agent-safe retry semantics).
 
+use crate::coalesce::{CoalesceConfig, CoalescePolicy, OutputCoalescer};
 use crate::encoding::decode;
 use crate::probe::which;
+use crate::process_identity::{self, ExpectedIdentity, IdentityVerdict};
 use crate::spec::{ExecKind, ExecResult, ExecSpec, Shell};
 use crate::taxonomy::classify_with_maps;
 use std::io::Read;
@@ -96,12 +98,17 @@ fn run_inner(
     tx: Option<mpsc::Sender<StreamChunk>>,
 ) -> ExecResult {
     let start = Instant::now();
+    // Every child receives a random generation token: embedded in its command
+    // text (argv-visible on every platform) and its environment (inherited by
+    // the whole tree). The tree-kill path verifies the pid still carries this
+    // identity before signalling, so a recycled pid can never be mis-killed.
+    let generation_token = process_identity::generate_generation_token();
     // Direct argv (toolchain runner) bypasses shell interpretation entirely.
     let (shell, argv) = match &spec.direct {
         Some(a) => (a.first().cloned().unwrap_or_default(), a.clone()),
         None => {
             let shell = resolve_shell(spec);
-            let mut argv = shell_argv(shell, spec);
+            let mut argv = shell_argv(shell, spec, &generation_token);
             // Resolve the shell binary through `which()` so Windows never
             // spawns the WSL launcher (`System32\bash.exe` — prints a
             // UTF-16LE "no distributions" message and exits 1) instead of a
@@ -126,6 +133,7 @@ fn run_inner(
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
+    cmd.env(process_identity::GENERATION_TOKEN_ENV, &generation_token);
     // Own process group so we can kill the whole tree.
     #[cfg(unix)]
     {
@@ -154,15 +162,44 @@ fn run_inner(
         }
     };
 
+    // Snapshot the child's identity at spawn. If the child exited instantly
+    // (snapshot fails) the epoch is `None` and the kill-time token check
+    // alone decides — which still catches a recycled pid.
+    //
+    // On Windows the snapshot costs a PowerShell spawn (~1 s), so it is only
+    // taken where the token cannot be verified at kill time: direct-argv runs
+    // (their env is not exposed) — and on unix where it is cheap. Shell runs
+    // carry the token in their argv (visible in `CommandLine`), which already
+    // proves identity, so Windows shell runs skip the snapshot.
+    let token_observable = spec.direct.is_none() || cfg!(not(windows));
+    let epoch_snapshot_needed = cfg!(not(windows)) || spec.direct.is_some();
+    let identity = ExpectedIdentity {
+        pid: child.id(),
+        generation_token: generation_token.clone(),
+        start_epoch_ms: if epoch_snapshot_needed {
+            process_identity::read_start_epoch_ms(child.id())
+        } else {
+            None
+        },
+        token_observable,
+    };
+
+    let coalesce_cfg: Option<CoalesceConfig> = match spec.coalesce {
+        CoalescePolicy::Off => None,
+        CoalescePolicy::Default => Some(CoalesceConfig::default()),
+        CoalescePolicy::Custom(c) => Some(c),
+    };
     let max = spec.effective_max_output();
     let stdout_thread = child.stdout.take().map(|s| {
         let tx = tx.clone();
-        thread::spawn(move || read_capped_maybe_stream(s, max, StreamKind::Stdout, tx))
+        let cfg = coalesce_cfg;
+        thread::spawn(move || read_capped_maybe_stream(s, max, StreamKind::Stdout, tx, cfg))
     });
-    let stderr_thread = child
-        .stderr
-        .take()
-        .map(|s| thread::spawn(move || read_capped_maybe_stream(s, max, StreamKind::Stderr, tx)));
+    let stderr_thread = child.stderr.take().map(|s| {
+        let tx = tx.clone();
+        let cfg = coalesce_cfg.filter(|c| c.coalesce_stderr);
+        thread::spawn(move || read_capped_maybe_stream(s, max, StreamKind::Stderr, tx, cfg))
+    });
 
     let timeout = Duration::from_millis(spec.effective_timeout_ms());
     let grace = Duration::from_millis(spec.effective_grace_ms());
@@ -170,6 +207,9 @@ fn run_inner(
     let mut signal: Option<i32> = None;
     let mut timed_out = false;
     let mut aborted = false;
+    // Set when the tree-kill was refused because the pid no longer refers to
+    // the process we spawned (recycled pid) — the run reports PID_REUSED.
+    let mut identity_refusal: Option<String> = None;
 
     // Deadline + abort polling loop.
     loop {
@@ -182,20 +222,18 @@ fn run_inner(
             Ok(None) => {
                 if abort.load(Ordering::SeqCst) {
                     aborted = true;
-                    #[cfg(unix)]
-                    kill_tree(&mut child, grace);
-                    #[cfg(windows)]
-                    kill_tree(&child, grace);
-                    let _ = child.wait();
+                    if let Err(refusal) = kill_tree_verified(&mut child, grace, &identity) {
+                        identity_refusal = Some(refusal);
+                        let _ = child.wait();
+                    }
                     break;
                 }
                 if start.elapsed() >= timeout {
                     timed_out = true;
-                    #[cfg(unix)]
-                    kill_tree(&mut child, grace);
-                    #[cfg(windows)]
-                    kill_tree(&child, grace);
-                    let _ = child.wait();
+                    if let Err(refusal) = kill_tree_verified(&mut child, grace, &identity) {
+                        identity_refusal = Some(refusal);
+                        let _ = child.wait();
+                    }
                     break;
                 }
                 thread::sleep(Duration::from_millis(5));
@@ -229,6 +267,13 @@ fn run_inner(
         truncated: stdout_trunc || stderr_trunc,
         shell_used: shell,
     };
+    // Kill refused on identity mismatch: report PID_REUSED instead of letting
+    // the taxonomy invent TIMEOUT/ABORTED for a process we did not touch.
+    if let Some(refusal) = identity_refusal {
+        result.error_class = Some("PID_REUSED".into());
+        result.hint = Some(refusal);
+        return result;
+    }
     let recipe_maps = if spec.error_maps.is_empty() {
         None
     } else {
@@ -275,14 +320,17 @@ fn default_posix_shell() -> Shell {
     }
 }
 
-/// Build the exact argv handed to `Command` — no string interpolation.
-fn shell_argv(shell: Shell, spec: &ExecSpec) -> Vec<String> {
+/// Build the exact argv handed to `Command` — no string interpolation. The
+/// generation token is embedded in the command text so it is argv-visible on
+/// every platform (see `process_identity::inject_generation_token`).
+fn shell_argv(shell: Shell, spec: &ExecSpec, generation_token: &str) -> Vec<String> {
+    let command = spec.command.clone();
     match shell {
         Shell::Bash | Shell::Sh | Shell::Zsh => {
             vec![
                 shell.as_str().to_string(),
                 "-c".into(),
-                spec.command.clone(),
+                process_identity::inject_generation_token(shell, &command, generation_token),
             ]
         }
         Shell::Pwsh | Shell::Powershell => {
@@ -297,14 +345,18 @@ fn shell_argv(shell: Shell, spec: &ExecSpec) -> Vec<String> {
                 shell.as_str().to_string(),
                 "-NoProfile".into(),
                 "-Command".into(),
-                format!("{} {}", recipe, spec.command),
+                format!(
+                    "{} {}",
+                    recipe,
+                    process_identity::inject_generation_token(shell, &command, generation_token)
+                ),
             ]
         }
         Shell::Cmd => {
             vec![
                 shell.as_str().to_string(),
                 "/C".into(),
-                spec.command.clone(),
+                process_identity::inject_generation_token(shell, &command, generation_token),
             ]
         }
     }
@@ -318,17 +370,25 @@ struct Captured {
 /// Read a stream to EOF, keeping only the **tail** `max` bytes but draining
 /// the rest so the child never blocks on a full pipe. Errors and results
 /// cluster at the end of output, so the tail is the diagnostic part agents
-/// actually need. When `tx` is `Some`, decoded chunks are streamed live.
+/// actually need. When `tx` is `Some`, decoded chunks are streamed live —
+/// through an `OutputCoalescer` when `coalesce` is `Some` (adjacent same-type
+/// chunks merged; forwarded on byte threshold / timer; final flush at EOF, so
+/// content is never lost).
 fn read_capped_maybe_stream<R: Read>(
     mut reader: R,
     max: usize,
     kind: StreamKind,
     tx: Option<mpsc::Sender<StreamChunk>>,
+    coalesce: Option<CoalesceConfig>,
 ) -> Captured {
     let mut tail: Vec<u8> = Vec::with_capacity(max.saturating_add(8192));
     let mut total: usize = 0;
     let mut chunk = [0u8; 8192];
     let mut dec = tx.as_ref().map(|_| IncrementalDecoder::new());
+    let coalescer = tx
+        .as_ref()
+        .zip(coalesce)
+        .map(|(tx, cfg)| OutputCoalescer::new(tx.clone(), cfg));
     loop {
         match reader.read(&mut chunk) {
             Ok(0) => break,
@@ -342,10 +402,16 @@ fn read_capped_maybe_stream<R: Read>(
                 if let Some(d) = &mut dec {
                     let text = d.push(&chunk[..n]);
                     if !text.is_empty() {
-                        let _ = tx.as_ref().unwrap().send(StreamChunk {
-                            stream: kind,
-                            text: crate::encoding::normalize_line_endings(&text),
-                        });
+                        let text = crate::encoding::normalize_line_endings(&text);
+                        match &coalescer {
+                            Some(co) => co.push(kind, text),
+                            None => {
+                                let _ = tx
+                                    .as_ref()
+                                    .unwrap()
+                                    .send(StreamChunk { stream: kind, text });
+                            }
+                        }
                     }
                 }
             }
@@ -355,11 +421,21 @@ fn read_capped_maybe_stream<R: Read>(
     if let Some(d) = &mut dec {
         let rest = d.finish();
         if !rest.is_empty() {
-            let _ = tx.as_ref().unwrap().send(StreamChunk {
-                stream: kind,
-                text: crate::encoding::normalize_line_endings(&rest),
-            });
+            let rest = crate::encoding::normalize_line_endings(&rest);
+            match &coalescer {
+                Some(co) => co.push(kind, rest),
+                None => {
+                    let _ = tx.as_ref().unwrap().send(StreamChunk {
+                        stream: kind,
+                        text: rest,
+                    });
+                }
+            }
         }
+    }
+    if let Some(co) = coalescer {
+        // EOF: forward whatever is buffered and stop the timer thread.
+        co.close();
     }
     Captured {
         bytes: tail,
@@ -475,6 +551,35 @@ fn kill_tree(child: &Child, _grace: Duration) {
         .status();
 }
 
+/// Terminate the whole tree only after verifying the pid still refers to the
+/// process we spawned (generation token + start epoch — see
+/// `process_identity`). The existing tree-kill logic (SIGTERM → SIGKILL after
+/// grace on POSIX, taskkill on Windows) is unchanged; this only gates it.
+///
+/// Returns `Err(description)` when the kill was refused because the pid was
+/// reused (classified `PID_REUSED` by the caller). `Ok` covers both "killed"
+/// and "already gone" (nothing to kill).
+fn kill_tree_verified(
+    child: &mut Child,
+    grace: Duration,
+    identity: &ExpectedIdentity,
+) -> Result<(), String> {
+    let verdict = process_identity::verify(identity, process_identity::IDENTITY_EPOCH_TOLERANCE_MS);
+    match verdict {
+        IdentityVerdict::Matches => {
+            #[cfg(unix)]
+            kill_tree(child, grace);
+            #[cfg(windows)]
+            kill_tree(child, grace);
+            Ok(())
+        }
+        IdentityVerdict::NotRunning => Ok(()), // exited on its own — nothing to kill
+        IdentityVerdict::StartEpochMismatch { .. } | IdentityVerdict::TokenMismatch => {
+            Err(format!("PID_REUSED: {}", verdict.describe()))
+        }
+    }
+}
+
 #[cfg(unix)]
 fn signal_of(status: &std::process::ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
@@ -571,5 +676,75 @@ mod tests {
         let r = run_with_abort_streaming(&sh_ok("sleep 5"), &abort, None);
         assert!(r.aborted);
         assert_eq!(r.error_class.as_deref(), Some("ABORTED"));
+    }
+
+    #[test]
+    fn generation_token_injection_does_not_change_output() {
+        if which("bash").is_none() {
+            return;
+        }
+        // Identity injection is default-on; the prefix `export
+        // UNIRUN_GENERATION_TOKEN=…;` must not leak into captured output.
+        let spec = sh_ok("echo hi");
+        let r = run(&spec);
+        assert_eq!(r.exit_code, Some(0));
+        assert_eq!(r.stdout, "hi\n", "output polluted by token: {:?}", r.stdout);
+        assert!(!r.stdout.contains("UNIRUN_GENERATION_TOKEN"));
+        assert!(!r.stderr.contains("UNIRUN_GENERATION_TOKEN"));
+    }
+
+    #[test]
+    fn generation_token_visible_in_child_env() {
+        if which("bash").is_none() {
+            return;
+        }
+        // The injected token must be readable from inside the child (it was
+        // both prefixed into the command text and passed via env).
+        let r = run(&sh_ok(
+            "test -n \"$UNIRUN_GENERATION_TOKEN\" && printf '%s' \"$UNIRUN_GENERATION_TOKEN\"",
+        ));
+        assert_eq!(r.exit_code, Some(0), "result: {:?}", r);
+        assert!(r.stdout.starts_with("ur"), "stdout: {:?}", r.stdout);
+    }
+
+    #[test]
+    fn no_coalesce_streams_same_content() {
+        if which("bash").is_none() {
+            return;
+        }
+        let mut spec = sh_ok("printf 'abc'; printf '中文'; echo boom >&2");
+        spec.coalesce = crate::coalesce::CoalescePolicy::Off;
+        let buffered = run(&spec);
+        let (tx, rx) = mpsc::channel();
+        let streamed = run_streaming(&spec, tx);
+        let chunks: Vec<StreamChunk> = rx.try_iter().collect();
+        let stdout_all: String = chunks
+            .iter()
+            .filter(|c| c.stream == StreamKind::Stdout)
+            .map(|c| c.text.as_str())
+            .collect();
+        let stderr_all: String = chunks
+            .iter()
+            .filter(|c| c.stream == StreamKind::Stderr)
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(stdout_all, buffered.stdout);
+        assert!(stderr_all.contains("boom"));
+        assert_eq!(streamed.stdout, buffered.stdout);
+        assert_eq!(streamed.exit_code, buffered.exit_code);
+    }
+
+    #[test]
+    fn direct_argv_runs_are_unaffected_by_injection() {
+        if cfg!(windows) {
+            return; // no standalone `echo` binary on Windows
+        }
+        let spec = ExecSpec {
+            direct: Some(vec!["echo".into(), "direct-ok".into()]),
+            ..Default::default()
+        };
+        let r = run(&spec);
+        assert_eq!(r.exit_code, Some(0), "result: {:?}", r);
+        assert_eq!(r.stdout, "direct-ok\n");
     }
 }
