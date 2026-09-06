@@ -362,13 +362,7 @@ fn cmd_ssh(args: &[String]) -> ExitCode {
         }
     };
     if positional.len() < 2 {
-        eprintln!("unirun ssh: usage: unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--timeout N]");
-        return ExitCode::from(2);
-    }
-    // Remote cwd/env are not yet supported — refuse loudly instead of
-    // silently ignoring them.
-    if opts.workdir.is_some() || !opts.env.is_empty() {
-        eprintln!("unirun ssh: --workdir/--env are not supported for remote execution (yet)");
+        eprintln!("unirun ssh: usage: unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--workdir DIR] [--env K=V] [--timeout N]");
         return ExitCode::from(2);
     }
     let mut target = unirun::SshTarget {
@@ -376,6 +370,8 @@ fn cmd_ssh(args: &[String]) -> ExitCode {
         user: opts.user.clone(),
         port: opts.port,
         identity_file: opts.identity.clone(),
+        workdir: opts.workdir.clone(),
+        env: opts.env.clone(),
         ..Default::default()
     };
     if let Some(s) = opts.shell {

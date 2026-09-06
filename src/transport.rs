@@ -43,6 +43,10 @@ pub struct SshTarget {
     pub port: Option<u16>,
     /// Optional identity file (`-i`).
     pub identity_file: Option<PathBuf>,
+    /// Optional remote working directory.
+    pub workdir: Option<PathBuf>,
+    /// Optional remote environment overrides.
+    pub env: Vec<(String, String)>,
 }
 
 impl Default for SshTarget {
@@ -55,6 +59,8 @@ impl Default for SshTarget {
             user: None,
             port: None,
             identity_file: None,
+            workdir: None,
+            env: Vec::new(),
         }
     }
 }
@@ -63,11 +69,87 @@ impl Default for SshTarget {
 /// with exact remote exit code and clean UTF-8 output. Windows targets use
 /// the win-exec payload machinery; Unix targets stream the script over stdin.
 pub fn ssh_run(target: &SshTarget, script: &str) -> ExecResult {
+    let script = prepare_script(target, script);
     match target.shell {
-        Shell::Powershell | Shell::Pwsh => ssh_powershell(target, script),
-        Shell::Cmd => ssh_cmd_file(target, script),
-        Shell::Bash | Shell::Sh | Shell::Zsh => ssh_unix(target, script),
+        Shell::Powershell | Shell::Pwsh => ssh_powershell(target, &script),
+        Shell::Cmd => ssh_cmd_file(target, &script),
+        Shell::Bash | Shell::Sh | Shell::Zsh => ssh_unix(target, &script),
     }
+}
+
+fn prepare_script(target: &SshTarget, script: &str) -> String {
+    let mut prefix = String::new();
+    match target.shell {
+        Shell::Powershell | Shell::Pwsh => {
+            if let Some(dir) = &target.workdir {
+                prefix.push_str("Set-Location -LiteralPath ");
+                prefix.push_str(&powershell_quote(&dir.to_string_lossy()));
+                prefix.push_str("\n");
+            }
+            for (key, value) in &target.env {
+                if valid_env_key(key) {
+                    prefix.push_str("$env:");
+                    prefix.push_str(key);
+                    prefix.push_str(" = ");
+                    prefix.push_str(&powershell_quote(value));
+                    prefix.push('\n');
+                }
+            }
+        }
+        Shell::Cmd => {
+            if let Some(dir) = &target.workdir {
+                prefix.push_str("cd /d \"");
+                prefix.push_str(&cmd_quote(&dir.to_string_lossy()));
+                prefix.push_str("\"\r\n");
+            }
+            for (key, value) in &target.env {
+                if valid_env_key(key) {
+                    prefix.push_str("set \"");
+                    prefix.push_str(key);
+                    prefix.push('=');
+                    prefix.push_str(&cmd_quote(value));
+                    prefix.push_str("\"\r\n");
+                }
+            }
+        }
+        Shell::Bash | Shell::Sh | Shell::Zsh => {
+            if let Some(dir) = &target.workdir {
+                prefix.push_str("cd ");
+                prefix.push_str(&posix_quote(&dir.to_string_lossy()));
+                prefix.push_str(" || exit $?");
+                prefix.push('\n');
+            }
+            for (key, value) in &target.env {
+                if valid_env_key(key) {
+                    prefix.push_str("export ");
+                    prefix.push_str(key);
+                    prefix.push('=');
+                    prefix.push_str(&posix_quote(value));
+                    prefix.push('\n');
+                }
+            }
+        }
+    }
+    prefix.push_str(script);
+    prefix
+}
+
+fn valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn posix_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn cmd_quote(value: &str) -> String {
+    value.replace('"', "\"\"")
 }
 
 /// Unix remote: script travels over stdin to `<shell> -s`, so no outer
@@ -422,6 +504,8 @@ mod tests {
             user: None,
             port: None,
             identity_file: None,
+            workdir: None,
+            env: Vec::new(),
         }
     }
 
@@ -463,6 +547,30 @@ mod tests {
         let a = ssh_argv(&t, "bash -s");
         assert!(a.contains(&"h.example".to_string()));
         assert!(!a.contains(&"@h.example".to_string()));
+    }
+
+    #[test]
+    fn prepare_script_unix_injects_cwd_and_env_safely() {
+        let mut t = target();
+        t.workdir = Some(PathBuf::from("/tmp/a path"));
+        t.env = vec![
+            ("A".into(), "one two".into()),
+            ("BAD-KEY".into(), "x".into()),
+        ];
+        let script = prepare_script(&t, "printf '%s' \"$A\"");
+        assert!(script.starts_with("cd '/tmp/a path' || exit $?\nexport A='one two'\n"));
+        assert!(!script.contains("BAD-KEY"));
+    }
+
+    #[test]
+    fn prepare_script_powershell_escapes_values() {
+        let mut t = target();
+        t.shell = Shell::Powershell;
+        t.workdir = Some(PathBuf::from("C:\\tmp\\it's"));
+        t.env = vec![("A".into(), "one's value".into())];
+        let script = prepare_script(&t, "Write-Output $env:A");
+        assert!(script.contains("Set-Location -LiteralPath 'C:\\tmp\\it''s'"));
+        assert!(script.contains("$env:A = 'one''s value'"));
     }
 
     #[test]

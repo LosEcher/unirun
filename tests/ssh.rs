@@ -38,6 +38,8 @@ fn unix_target(shell: Shell) -> SshTarget {
         identity_file: std::env::var("UNIRUN_TEST_SSH_IDENTITY")
             .ok()
             .map(PathBuf::from),
+        workdir: None,
+        env: Vec::new(),
     }
 }
 

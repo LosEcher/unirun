@@ -311,7 +311,9 @@ pub fn status(id: &str) -> Result<SessionState, String> {
         if let Some(pid) = st.pid {
             if !pid_alive(pid) {
                 st.status = "interrupted".into();
-                st.finished_at = Some(now_millis());
+                let finished_at = now_millis();
+                st.finished_at = Some(finished_at);
+                st.duration_ms = finished_at.saturating_sub(st.started_at);
                 let _ = write_json(&session_dir(id).join("state.json"), &st);
             }
         }
@@ -358,7 +360,9 @@ pub fn kill(id: &str) -> Result<SessionState, String> {
             IdentityVerdict::NotRunning => {
                 // Runner already gone (exited or zombie): mark interrupted.
                 st.status = "interrupted".into();
-                st.finished_at = Some(now_millis());
+                let finished_at = now_millis();
+                st.finished_at = Some(finished_at);
+                st.duration_ms = finished_at.saturating_sub(st.started_at);
                 write_json(&session_dir(id).join("state.json"), &st)?;
                 return Ok(st);
             }
@@ -635,7 +639,7 @@ mod tests {
             label: "fake".into(),
             status: "running".into(),
             pid: Some(999_999_999), // certainly gone
-            started_at: now_millis(),
+            started_at: now_millis().saturating_sub(1_000),
             finished_at: None,
             exit_code: None,
             error_class: None,
@@ -649,6 +653,8 @@ mod tests {
         write_json(&dir.join("state.json"), &state).unwrap();
         let st = kill(&id).unwrap();
         assert_eq!(st.status, "interrupted", "state: {:?}", st);
+        assert!(st.finished_at.is_some());
+        assert!(st.duration_ms > 0);
         std::env::remove_var("UNIRUN_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

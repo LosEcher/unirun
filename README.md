@@ -110,7 +110,7 @@ unirun script path/to/script [options]     # shell inferred from extension
 unirun probe [--json]                      # host capability snapshot
 unirun mcp                                 # serve MCP over stdio (agents)
 unirun acp                                 # serve Agent Client Protocol v1 over stdio
-unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE]   # remote SSH
+unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--workdir dir] [--env K=V]   # remote SSH
 unirun winrm <host> '<script>' [opts]      # remote Windows (WinRM; feature: winrm)
 unirun bg <start|status|output|kill|wait|list> ...   # background sessions
 unirun recipe <list|show|add|rm|path|effective|check> # recipe registry
@@ -179,11 +179,14 @@ content works). cmd.exe targets run via temp `.bat` files.
 
 Unix targets (bash / sh / zsh) stream the script over stdin to `<shell> -s`,
 so no outer quoting layer can corrupt it; the script's own exit code
-propagates exactly.
+propagates exactly. `--workdir` changes the remote working directory before
+the script starts, and repeated `--env K=V` assignments set validated
+environment keys on the remote shell. Values are escaped per shell; invalid
+environment variable names are ignored.
 
 ```bash
-unirun ssh linux-host 'echo 中文OK; exit 42' --shell bash --json
-unirun ssh win-srv 'Write-Output hi' --shell powershell --user admin --port 22 --identity ~/.ssh/id_ed25519
+unirun ssh linux-host 'echo 中文OK; exit 42' --shell bash --workdir /srv/app --env APP_ENV=prod --json
+unirun ssh win-srv 'Write-Output hi' --shell powershell --user admin --port 22 --identity ~/.ssh/id_ed25519 --env APP_ENV=prod
 ```
 
 Identity options: `--user U` (user@host), `--port N`, `--identity FILE`
