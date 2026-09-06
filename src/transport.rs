@@ -84,7 +84,7 @@ fn prepare_script(target: &SshTarget, script: &str) -> String {
             if let Some(dir) = &target.workdir {
                 prefix.push_str("Set-Location -LiteralPath ");
                 prefix.push_str(&powershell_quote(&dir.to_string_lossy()));
-                prefix.push_str("\n");
+                prefix.push('\n');
             }
             for (key, value) in &target.env {
                 if valid_env_key(key) {
