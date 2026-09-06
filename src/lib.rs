@@ -5,11 +5,13 @@
 //! (see `main.rs`), plus the optional `winrm`-feature WinRM provider.
 
 pub mod acp;
+pub mod coalesce;
 pub mod encoding;
 pub mod error_maps;
 pub mod exec;
 pub mod mcp;
 pub mod probe;
+pub mod process_identity;
 pub mod recipe;
 pub mod session;
 pub mod spec;

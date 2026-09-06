@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use unirun::coalesce::CoalescePolicy;
 use unirun::exec::install_sigint_handler;
 use unirun::recipe::Recipe;
 use unirun::spec::{ExecKind, ExecResult, ExecSpec, Shell};
@@ -36,6 +37,8 @@ OPTIONS:
   --workdir <dir>    working directory
   --env K=V          environment override (repeatable)
   --toolchain <name> run via a recipe toolchain runner (e.g. python -> uv run)
+  --no-coalesce       disable output coalescing (streamed stdout is forwarded
+                      in raw chunks instead of merged batches)
   --user <name>      SSH user for `unirun ssh` (user@host)
   --port <n>         SSH port for `unirun ssh` (default 22 / ssh config)
   --identity <file>  SSH identity file for `unirun ssh` (-i)
@@ -111,6 +114,7 @@ struct CliOpts {
     toolchain: Option<String>,
     label: Option<String>,
     tail_bytes: Option<usize>,
+    no_coalesce: bool,
     json: bool,
     pretty: bool,
     /// SSH-only: `unirun ssh` identity options.
@@ -161,6 +165,7 @@ fn parse_flags(args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, Strin
                 let v = args.get(i).ok_or("--toolchain needs a value")?;
                 opts.toolchain = Some(v.clone());
             }
+            "--no-coalesce" => opts.no_coalesce = true,
             "--user" => {
                 i += 1;
                 let v = args.get(i).ok_or("--user needs a value")?;
@@ -201,6 +206,11 @@ fn build_spec(command: String, kind: ExecKind, opts: &CliOpts) -> ExecSpec {
         workdir: opts.workdir.clone(),
         env: opts.env.clone(),
         timeout_ms: opts.timeout_sec.map(|s| s * 1000).unwrap_or(0),
+        coalesce: if opts.no_coalesce {
+            CoalescePolicy::Off
+        } else {
+            CoalescePolicy::Default
+        },
         ..Default::default()
     };
     // Per-project adaptation: auto-apply recipe defaults when the caller did
@@ -352,13 +362,7 @@ fn cmd_ssh(args: &[String]) -> ExitCode {
         }
     };
     if positional.len() < 2 {
-        eprintln!("unirun ssh: usage: unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--timeout N]");
-        return ExitCode::from(2);
-    }
-    // Remote cwd/env are not yet supported — refuse loudly instead of
-    // silently ignoring them.
-    if opts.workdir.is_some() || !opts.env.is_empty() {
-        eprintln!("unirun ssh: --workdir/--env are not supported for remote execution (yet)");
+        eprintln!("unirun ssh: usage: unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--workdir DIR] [--env K=V] [--timeout N]");
         return ExitCode::from(2);
     }
     let mut target = unirun::SshTarget {
@@ -366,6 +370,8 @@ fn cmd_ssh(args: &[String]) -> ExitCode {
         user: opts.user.clone(),
         port: opts.port,
         identity_file: opts.identity.clone(),
+        workdir: opts.workdir.clone(),
+        env: opts.env.clone(),
         ..Default::default()
     };
     if let Some(s) = opts.shell {
@@ -614,6 +620,11 @@ fn cmd_bg(args: &[String]) -> ExitCode {
                 workdir: opts.workdir.clone(),
                 env: opts.env.clone(),
                 timeout_ms: opts.timeout_sec.map(|s| s * 1000).unwrap_or(0),
+                coalesce: if opts.no_coalesce {
+                    CoalescePolicy::Off
+                } else {
+                    CoalescePolicy::Default
+                },
                 ..Default::default()
             };
             match sess::start(&spec, &label) {
