@@ -100,11 +100,16 @@ fn mcp_exec_run_ok() {
             "arguments": { "command": "echo hello-mcp" }
         }),
     );
-    assert_eq!(result["isError"], serde_json::json!(false));
+    assert_eq!(
+        result["isError"],
+        serde_json::json!(false),
+        "exec.run reported an error; full result: {}",
+        result
+    );
     let text = result["content"][0]["text"].as_str().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["exit_code"], serde_json::json!(0));
-    assert_eq!(parsed["stdout"], "hello-mcp\n");
+    assert_eq!(parsed["exit_code"], serde_json::json!(0), "result: {}", parsed);
+    assert_eq!(parsed["stdout"], "hello-mcp\n", "result: {}", parsed);
     s.close();
 }
 
