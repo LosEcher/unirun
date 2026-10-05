@@ -10,6 +10,8 @@
 
 本文是 2026-10-05 的审计快照；逐条修复记录在这里（编号对应第 0 节，提交号可在 `git log` 复核）。
 
+**里程碑**：`main` 于 2026-10-05 三平台 + msrv 全绿（run `37253792695`，head `bb4b08c`）——自 2026-09-06 以来首次；此前 29 天 CI 全红。
+
 | 事项 | 状态 | 提交 / 证据 |
 |---|---|---|
 | P0-1 clippy 1.98 新 lint 挂 main | 已修 | `c269350`：`units.chunks_exact(2)` → `as_chunks::<2>().0.iter()`（语义等价，仍丢弃尾部奇数字节） |
@@ -22,12 +24,15 @@
 | Windows clippy `unused import` | 已修 | `918c980`：`thread` / `Duration` / `Instant` 仅在 `#[cfg(unix)]` 测试模块使用 |
 | Windows 身份/存活探针失效 | 已修 | `b3ca75e`：`is_alive` 补真实存活探测；`read_windows_identity` 改发 epoch 毫秒并容忍 `/Date(<ms>)/` 渲染 |
 | Windows 默认 shell 每次运行误报 `COMMAND_NOT_FOUND` | 已修 | `182516d`：PowerShell 的 `=` 右值按语句解析，裸词会被当命令执行 ⇒ token 必须加引号；同时 `command_carries_token` 接受带引号的 token（实测 `bare_needle=false/quoted_needle=true`，不同步改会让 Windows 树杀全部退化成 TokenMismatch 拒绝） |
-| P1-1 身份校验静默降级（`ps` 不可用即跳过 start-epoch） | **未修** | 仍需 `Unverifiable` / fail-closed 语义 |
-| P0-3 发布 v0.3.1（tag + 平台资产 + `cargo publish`） | **未执行** | 不可逆动作，待确认后执行 |
+| P1-1 身份校验静默降级（`ps` 不可用即跳过 start-epoch） | 已修 | `bb4b08c`：新增 `IdentityVerdict::Unverifiable`——token 不可观测且没抓到 start-epoch 时不再返回 `Matches`，两个调用方都拒杀，exec 侧报 `IDENTITY_UNVERIFIABLE`（不再借用 `PID_REUSED` 这个不成立的类）；同时把探针缺失时的身份测试改为跳过（沙箱内 `cargo test --lib` 由 4 红转绿）。同一提交还修掉 CI 暴露的 fork→execve 窗口误判（详见下一行） |
+| fork→execve 窗口内误判 PID_REUSED（CI 发现） | 已修 | `bb4b08c`：`fork` 后 `execve` 前子进程仍带**父进程**的 argv/env，token 不可见而 start-epoch 匹配 ⇒ 立即 abort/SIGINT 会拒杀自己的子进程（ubuntu 上 `run_with_custom_abort_flag_reports_aborted` 实报 `PID_REUSED`）。`verify_before_kill` 限时 250ms 重读后再拒（回收的 pid 不会获得随机 token，保证不变） |
+| P0-3 发布（tag + 平台资产 + `cargo publish`） | **未执行** | tag 只触发 GitHub Release（`ci.yml` 的 `publish` job 不发布 crate）；`cargo publish` 不可逆，待确认版本号后执行 |
 | P1-2 los 集成漂移 | **未修** | 改动在 los 仓（本会话工作区之外），需另开范围 |
-| P2-3 fmtguard 台账保留 / P3 文档收尾 | **未做** | 低优先级 |
+| P2-3 fmtguard 台账保留 | **未修** | 改的是 fmtguard 仓（工作区之外）；本仓侧 `.fmtguard/runs.jsonl` 已 gitignore，无仓库内动作 |
+| P3 文档收尾 | 部分已修 | `bb4b08c` 给 `docs/SESSION-AGENT-ADOPTION-PLAN.md` 补了状态行；复核发现 README Roadmap 本就有 P4（该条为误报）。tag↔crate 漂移待随发布一起收口 |
+| **新发现（未修）** | 「读不到进程」被当成「进程已退出」：`read_process_identity` 在探针不可用时返回 `None` ⇒ `NotRunning` ⇒ 树杀被静默跳过，而结果仍报 TIMEOUT（仿佛已终止） | 沙箱内 `cargo test --all-targets`：`tests/matrix.rs::t_timeout_kills_and_classifies` 与 `t_timeout_kills_whole_tree` 必红（16 passed / 2 failed）；同一棵树非沙箱全绿。改动前后行为一致（`NotRunning => Ok(())` 未变），故非本次回归 | 把 `read_process_identity` 的「已退出」与「读不到」分开（`Gone` vs `Unreadable`），后者走 fail-closed 并如实分类。**需先定策略**：探针不可用时是"不杀并如实报错"还是"绕过校验尽力杀"，属行为决策，未擅自改 |
 
-审计后新增的回归测试：`injected_token_is_recognizable_by_the_verifier_for_every_shell`（六种 shell 的 inject→verify 往返，钉住注入器与校验器必须同步演进）与 `default_shell_run_reports_no_spurious_error`（Windows 默认 shell 端到端，其它身份测试都固定在 `Shell::Bash` 且 bash 缺失时提前返回，这正是默认-shell 缺陷能长期存活的原因）。
+审计后新增的回归测试：`injected_token_is_recognizable_by_the_verifier_for_every_shell`（六种 shell 的 inject→verify 往返，钉住注入器与校验器必须同步演进）、`default_shell_run_reports_no_spurious_error`（Windows 默认 shell 端到端，其它身份测试都固定在 `Shell::Bash` 且 bash 缺失时提前返回，这正是默认-shell 缺陷能长期存活的原因）与 `verify_before_kill_waits_out_the_fork_exec_window`（宽限必须被遵守且宽限后仍拒杀）。修复后测试基线（非沙箱）：lib 80 + 集成 7/18/9/8/5 全绿，9 ignored（SSH/WinRM 冒烟）。
 
 ---
 
