@@ -191,7 +191,10 @@ pub fn command_carries_token(command: &str, token: &str) -> bool {
     false
 }
 
-/// True when the process exists and is not a zombie.
+/// True when the process is there and is not a zombie. An environment that
+/// cannot answer counts as alive: a runner nobody can inspect must not be
+/// reported as already gone (killing it is gated separately — see
+/// [`Observed`]).
 pub fn is_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
