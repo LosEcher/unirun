@@ -173,8 +173,17 @@ pub fn is_alive(pid: u32) -> bool {
         if !signalable {
             return false;
         }
+        !is_zombie(pid)
     }
-    !is_zombie(pid)
+    #[cfg(windows)]
+    {
+        // Windows has no signal-0 probe. Without this branch every non-zero
+        // pid counted as alive, so a crashed background session never settled
+        // as `interrupted` and `kill` saw no reason to stop. The process list
+        // is the probe (one PowerShell call, the same cost macOS already pays
+        // for `ps`).
+        read_windows_identity(pid).is_some()
+    }
 }
 
 /// True when the process exists but has already exited (POSIX zombie).
@@ -209,11 +218,11 @@ pub fn read_start_epoch_ms(pid: u32) -> Option<u64> {
 /// Read the full observable identity of `pid`. `None` when the process does
 /// not exist, is a zombie, or cannot be queried.
 pub fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
-    if !is_alive(pid) {
-        return None;
-    }
     #[cfg(unix)]
     {
+        if !is_alive(pid) {
+            return None;
+        }
         let start_epoch_ms = read_start_epoch_unix(pid)?;
         let command = read_command(pid).unwrap_or_default();
         Some(ProcessIdentity {
@@ -224,6 +233,8 @@ pub fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
     }
     #[cfg(windows)]
     {
+        // `read_windows_identity` is itself the liveness probe on Windows;
+        // gating it behind `is_alive` first would shell out twice per read.
         read_windows_identity(pid)
     }
 }
@@ -460,8 +471,17 @@ fn nul_join(bytes: &[u8]) -> String {
 
 #[cfg(windows)]
 fn read_windows_identity(pid: u32) -> Option<ProcessIdentity> {
+    // Emit epoch milliseconds directly. `CreationDate` is a PowerShell
+    // `DateTime`, and its JSON rendering is not the raw CIM string this code
+    // used to parse: Windows PowerShell 5.1 (what windows-latest runs) emits
+    // `/Date(1791162553132)/`, so every Windows read returned `None` and the
+    // identity/liveness layer silently degraded. `CommandLine` can also be
+    // null for some processes, which must not read as "process gone".
     let script = format!(
-        "$p=Get-CimInstance Win32_Process -Filter 'ProcessId = {}'; if ($null -ne $p) {{ @{{CreationDate=$p.CreationDate;CommandLine=$p.CommandLine}}|ConvertTo-Json -Compress }}",
+        "$p=Get-CimInstance Win32_Process -Filter 'ProcessId = {}'; \
+         if ($null -ne $p) {{ \
+         $ms=[int64](($p.CreationDate.ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds); \
+         @{{EpochMs=$ms;CommandLine=$p.CommandLine}} | ConvertTo-Json -Compress }}",
         pid
     );
     let out = Command::new("powershell.exe")
@@ -477,17 +497,43 @@ fn read_windows_identity(pid: u32) -> Option<ProcessIdentity> {
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    let creation = v.get("CreationDate").and_then(|s| s.as_str())?;
-    let command = v.get("CommandLine").and_then(|s| s.as_str())?;
-    let command = command.trim();
-    if command.is_empty() {
-        return None;
-    }
+    let start_epoch_ms = match v.get("EpochMs").and_then(|n| n.as_i64()) {
+        Some(ms) if ms >= 0 => ms as u64,
+        // Older/alternate renderings still carry the creation stamp.
+        _ => parse_creation_date(v.get("CreationDate").and_then(|s| s.as_str())?)?,
+    };
+    let command = v
+        .get("CommandLine")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     Some(ProcessIdentity {
         pid,
-        start_epoch_ms: parse_wmi_datetime(creation)?,
-        command: command.to_string(),
+        start_epoch_ms,
+        command,
     })
+}
+
+/// Parse a creation stamp in either shape it reaches us: the raw CIM form
+/// (`20260820120000.000000+480`) or PowerShell's JSON rendering of a
+/// `DateTime` (`/Date(1791162553132)/`, Windows PowerShell 5.1).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_creation_date(s: &str) -> Option<u64> {
+    match s.strip_prefix("/Date(").and_then(|r| r.strip_suffix(")/")) {
+        // Milliseconds since the epoch, optionally followed by an offset.
+        Some(inner) => inner
+            .split(['+', '-'])
+            .next()
+            .unwrap_or(inner)
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n >= 0)
+            .map(|n| n as u64),
+        // The raw CIM form (`20260820120000.000000+480`).
+        None => parse_wmi_datetime(s),
+    }
 }
 
 /// Parse a WMI CIM datetime (`20260820120000.000000+480`) into epoch ms.
@@ -824,5 +870,27 @@ mod tests {
         );
         assert!(parse_wmi_datetime("garbage").is_none());
         assert!(parse_wmi_datetime("20260820").is_none());
+    }
+
+    /// Regression for the Windows reader: `Get-CimInstance` hands back a
+    /// `DateTime`, and Windows PowerShell 5.1 renders it as `/Date(<ms>)/`,
+    /// which the CIM-string parser cannot read. Both shapes must parse.
+    #[test]
+    fn creation_date_parses_both_renderings() {
+        assert_eq!(
+            parse_creation_date("/Date(1787227200000)/"),
+            Some(1_787_227_200_000)
+        );
+        assert_eq!(
+            parse_creation_date("/Date(1787227200000+0800)/"),
+            Some(1_787_227_200_000)
+        );
+        // The raw CIM form still works.
+        assert_eq!(
+            parse_creation_date("20260820120000.000000+000"),
+            Some(1_787_227_200_000)
+        );
+        assert!(parse_creation_date("garbage").is_none());
+        assert!(parse_creation_date("/Date()/").is_none());
     }
 }
