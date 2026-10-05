@@ -108,7 +108,12 @@ fn mcp_exec_run_ok() {
     );
     let text = result["content"][0]["text"].as_str().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["exit_code"], serde_json::json!(0), "result: {}", parsed);
+    assert_eq!(
+        parsed["exit_code"],
+        serde_json::json!(0),
+        "result: {}",
+        parsed
+    );
     assert_eq!(parsed["stdout"], "hello-mcp\n", "result: {}", parsed);
     s.close();
 }
