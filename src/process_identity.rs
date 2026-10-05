@@ -539,7 +539,11 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the `#[cfg(unix)]` tests below use threads and timeouts; importing
+    // them unconditionally made Windows clippy fail on unused imports.
+    #[cfg(unix)]
     use std::thread;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     fn identity(pid: u32, epoch: u64, command: &str) -> ProcessIdentity {
