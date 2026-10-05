@@ -118,6 +118,16 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      # A tag that disagrees with the crate version ships binaries whose name
+      # lies about their contents and leaves tag↔crate drift behind (v0.2.1 has
+      # a tag but was never published). Refuse before the release exists.
+      - name: Assert the tag matches the crate version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v${version}" = "${GITHUB_REF_NAME}" || {
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml v${version}"; exit 1; }
+          echo "tag ${GITHUB_REF_NAME} matches Cargo.toml ${version}"
       - uses: actions/download-artifact@v4
         with:
           path: dist
