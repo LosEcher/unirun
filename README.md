@@ -335,6 +335,26 @@ spawn itself.
 Independent by design: MCP + CLI only, no harness dependency, no telemetry,
 MIT licensed.
 
+## Releasing
+
+`Cargo.toml` is the single source of truth: the tag must be
+`v<Cargo.toml version>`, and CI asserts exactly that before it creates the
+GitHub Release, so the tag, the crate and the release assets always agree
+(`v0.2.1` is the historical counter-example — a tag with no published crate).
+The crate itself is published by hand from a clean tree at the tagged commit,
+because a crates.io release is irreversible (a version can be yanked but never
+deleted or replaced).
+
+```sh
+# 1. bump `version` in Cargo.toml and refresh the lockfile
+cargo check --all-targets
+git commit -am "chore(release): X.Y.Z" && git push origin main
+# 2. once main is green (test × 3 platforms + msrv), tag that exact commit
+git tag vX.Y.Z && git push origin vX.Y.Z
+# 3. after the release job publishes the five platform assets
+cargo publish
+```
+
 ## License
 
 MIT © 2026 LosEcher
