@@ -693,6 +693,26 @@ mod tests {
         assert!(!r.stderr.contains("UNIRUN_GENERATION_TOKEN"));
     }
 
+    /// The default shell on Windows is PowerShell, where the right-hand side of
+    /// `=` is parsed as a *statement*: an unquoted `$env:NAME=<token>` runs the
+    /// token as a command, pollutes stderr and the taxonomy reports
+    /// `COMMAND_NOT_FOUND` for every default-shell run. The other identity
+    /// tests pin `shell: Some(Shell::Bash)` (and skip when bash is absent), so
+    /// this one deliberately exercises the resolved default shell end to end.
+    #[cfg(windows)]
+    #[test]
+    fn default_shell_run_reports_no_spurious_error() {
+        let spec = ExecSpec {
+            command: "echo unirun-default-shell".into(),
+            ..Default::default()
+        };
+        let r = run(&spec);
+        assert_eq!(r.exit_code, Some(0), "result: {:?}", r);
+        assert_eq!(r.error_class, None, "result: {:?}", r);
+        assert_eq!(r.stdout, "unirun-default-shell\n", "result: {:?}", r);
+        assert!(r.stderr.is_empty(), "stderr polluted: {:?}", r.stderr);
+    }
+
     #[test]
     fn generation_token_visible_in_child_env() {
         if which("bash").is_none() {

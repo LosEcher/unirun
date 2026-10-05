@@ -113,8 +113,13 @@ pub fn generate_generation_token() -> String {
 /// assignment — in the child's environment, inherited by the whole tree:
 ///
 /// - POSIX shells:  `export UNIRUN_GENERATION_TOKEN=<tok>; <cmd>`
-/// - PowerShell:    `$env:UNIRUN_GENERATION_TOKEN=<tok>; <cmd>` (tokens are
-///   always hex, so no quoting is needed)
+/// - PowerShell:    `$env:UNIRUN_GENERATION_TOKEN='<tok>'; <cmd>` — the value
+///   **must** be quoted. PowerShell parses the right-hand side of `=` as a
+///   *statement*, so a bare word is run as a command: `$env:X=ur7` executes
+///   `ur7`, prints "not recognized as the name of a cmdlet" on stderr and
+///   leaves the variable unset. Numeric literals happen to work, so only
+///   unquoted word-like tokens (ours) expose it. Verified on Windows
+///   PowerShell 5.1 for `-Command`, script blocks and `.ps1` files alike.
 /// - cmd.exe:       `set UNIRUN_GENERATION_TOKEN=<tok>&& <cmd>`
 ///
 /// The assignment only (re)sets the same env var unirun already passes to the
@@ -123,40 +128,50 @@ pub fn inject_generation_token(shell: Shell, command: &str, token: &str) -> Stri
     match shell {
         Shell::Cmd => format!("set {}{}&& {}", TOKEN_ASSIGN_PREFIX, token, command),
         Shell::Powershell | Shell::Pwsh => {
-            format!("$env:{}{}; {}", TOKEN_ASSIGN_PREFIX, token, command)
+            format!("$env:{}'{}'; {}", TOKEN_ASSIGN_PREFIX, token, command)
         }
         _ => format!("export {}{}; {}", TOKEN_ASSIGN_PREFIX, token, command),
     }
 }
 
-/// True when `command` carries `UNIRUN_GENERATION_TOKEN=<token>` with
+/// True when `command` carries `UNIRUN_GENERATION_TOKEN=<token>` — optionally
+/// quoted (`UNIRUN_GENERATION_TOKEN='<token>'`, the PowerShell spelling) — with
 /// non-alphanumeric neighbors. The injected token can be surrounded by shell
 /// syntax (`;`, `&`, `'`, whitespace), so the boundary rule only guards the
 /// real false-positive: a longer token value (`ur1234`) must not match a
-/// shorter one (`ur123`).
+/// shorter one (`ur123`). A recycled pid would have to reproduce the whole
+/// random token, quoted or not.
 pub fn command_carries_token(command: &str, token: &str) -> bool {
     if token.is_empty() {
         return false;
     }
-    let needle = format!("{}{}", TOKEN_ASSIGN_PREFIX, token);
     let mut offset = 0;
-    while let Some(pos) = command[offset..].find(&needle) {
+    while let Some(pos) = command[offset..].find(TOKEN_ASSIGN_PREFIX) {
         let abs = offset + pos;
+        let value_start = abs + TOKEN_ASSIGN_PREFIX.len();
         let before_ok = abs == 0
             || !command[..abs]
                 .chars()
                 .next_back()
                 .is_some_and(|c| c.is_ascii_alphanumeric());
-        let end = abs + needle.len();
-        let after_ok = end == command.len()
-            || !command[end..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphanumeric());
-        if before_ok && after_ok {
-            return true;
+        // Shells that need a string expression quote the value; skip one quote
+        // so the identical token matches in either spelling.
+        let token_start = match command[value_start..].chars().next() {
+            Some(quote @ ('\'' | '"')) => value_start + quote.len_utf8(),
+            _ => value_start,
+        };
+        if before_ok && command[token_start..].starts_with(token) {
+            let end = token_start + token.len();
+            let after_ok = end == command.len()
+                || !command[end..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
+            if after_ok {
+                return true;
+            }
         }
-        offset = end;
+        offset = value_start;
     }
     false
 }
@@ -619,6 +634,57 @@ mod tests {
             "powershell -Command $env:UNIRUN_GENERATION_TOKEN=ur7; Write-Host hi",
             "ur7"
         ));
+        // PowerShell quotes the value (a bare word after `=` is a command), so
+        // the verifier must accept the quoted spelling…
+        assert!(command_carries_token(
+            "powershell -Command $env:UNIRUN_GENERATION_TOKEN='ur7'; Write-Host hi",
+            "ur7"
+        ));
+        assert!(command_carries_token(
+            "powershell -Command $env:UNIRUN_GENERATION_TOKEN=\"ur7\"; Write-Host hi",
+            "ur7"
+        ));
+        // …without weakening the exact-token rule.
+        assert!(!command_carries_token(
+            "powershell -Command $env:UNIRUN_GENERATION_TOKEN='ur7'; Write-Host hi",
+            "ur"
+        ));
+        assert!(!command_carries_token(
+            "powershell -Command $env:UNIRUN_GENERATION_TOKEN='ur77'; Write-Host hi",
+            "ur7"
+        ));
+    }
+
+    /// The injector and the kill-time verifier are a matched pair: if the
+    /// injected text stops being recognizable, every tree-kill turns into a
+    /// `TokenMismatch` refusal (fail-closed but useless). Round-trip every shell
+    /// so a change to either side has to keep the other one working.
+    #[test]
+    fn injected_token_is_recognizable_by_the_verifier_for_every_shell() {
+        let shells = [
+            Shell::Bash,
+            Shell::Sh,
+            Shell::Zsh,
+            Shell::Powershell,
+            Shell::Pwsh,
+            Shell::Cmd,
+        ];
+        for shell in shells {
+            let injected = inject_generation_token(shell, "echo hi", "ur7");
+            assert!(
+                command_carries_token(&injected, "ur7"),
+                "{:?} injection is not recognized by the verifier: {}",
+                shell,
+                injected
+            );
+            // A different token must not be accepted for this command.
+            assert!(
+                !command_carries_token(&injected, "ur8"),
+                "{:?} injection matched the wrong token: {}",
+                shell,
+                injected
+            );
+        }
     }
 
     #[test]
@@ -633,7 +699,11 @@ mod tests {
         );
         assert_eq!(
             inject_generation_token(Shell::Powershell, "Write-Host hi", "tok2"),
-            "$env:UNIRUN_GENERATION_TOKEN=tok2; Write-Host hi"
+            "$env:UNIRUN_GENERATION_TOKEN='tok2'; Write-Host hi"
+        );
+        assert_eq!(
+            inject_generation_token(Shell::Pwsh, "Write-Host hi", "tok2"),
+            "$env:UNIRUN_GENERATION_TOKEN='tok2'; Write-Host hi"
         );
         assert_eq!(
             inject_generation_token(Shell::Cmd, "echo hi", "tok3"),
