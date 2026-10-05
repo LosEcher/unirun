@@ -93,7 +93,7 @@ fn looks_utf16le_without_bom(bytes: &[u8]) -> bool {
 
 fn decode_utf16(units: &[u8], little_endian: bool) -> String {
     let mut out = String::new();
-    let mut chars = units.chunks_exact(2).map(|c| {
+    let mut chars = units.as_chunks::<2>().0.iter().map(|c| {
         let u = u16::from_le_bytes([c[0], c[1]]);
         if little_endian {
             u
