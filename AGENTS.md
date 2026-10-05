@@ -24,7 +24,14 @@ fmtguard --scope-from-git --apply
 fmtguard --scope-from-git --emit json   # verdict 必须是 "ok"
 git diff --check                        # 无空白错误
 git diff --stat                         # 规模符合预期（未被 formatter 放大）
+
+# 4. 最终裁决（必须）：fmtguard 只保证改动范围不新增格式债，不保证整文件
+#    rustfmt-clean；CI 门禁是 cargo fmt --check（检查整个文件），以它为准。
+cargo fmt --check                       # 红 = scope 外有债：整文件 cargo fmt 或手动补齐，不允许带红提交
 ```
+
+> 职责分工：fmtguard = 范围裁剪器（限制 formatter 改动范围，防全文件重排）；
+> `cargo fmt --check` = 整文件干净性裁决（CI 门禁语义）。fmtguard 报 ok ≠ 文件干净。
 
 退出码契约：`0` = ok / 无事可做；`1` = 某道门禁拒绝（**任何文件都不写盘**）——
 先检查自己的改动，不要盲目放宽预算；`2` = fmtguard 自身出错（含 rustfmt 解析失败），
