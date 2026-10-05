@@ -406,6 +406,16 @@ pub fn kill(id: &str) -> Result<SessionState, String> {
                     verdict.describe()
                 ));
             }
+            IdentityVerdict::Unverifiable => {
+                // Fail closed: the runner pid exists but nothing ties it to the
+                // stored identity (no start epoch, token not observable), so
+                // signalling it could hit an innocent process.
+                return Err(format!(
+                    "refusing to kill session {}: IDENTITY_UNVERIFIABLE — {}",
+                    id,
+                    verdict.describe()
+                ));
+            }
         }
     }
 
@@ -611,6 +621,13 @@ mod tests {
 
     #[test]
     fn kill_refuses_recycled_identity() {
+        // Needs the platform probe (ps/CIM) to see our own process; without it
+        // the identity reads as `NotRunning` and this test would assert on the
+        // wrong arm. Skip instead of failing for a missing capability.
+        if !process_identity::platform_probe_available() {
+            eprintln!("skipping: this environment cannot report process identities");
+            return;
+        }
         let _guard = crate::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());

@@ -209,7 +209,7 @@ fn run_inner(
     let mut aborted = false;
     // Set when the tree-kill was refused because the pid no longer refers to
     // the process we spawned (recycled pid) — the run reports PID_REUSED.
-    let mut identity_refusal: Option<String> = None;
+    let mut identity_refusal: Option<IdentityVerdict> = None;
 
     // Deadline + abort polling loop.
     loop {
@@ -267,11 +267,20 @@ fn run_inner(
         truncated: stdout_trunc || stderr_trunc,
         shell_used: shell,
     };
-    // Kill refused on identity mismatch: report PID_REUSED instead of letting
-    // the taxonomy invent TIMEOUT/ABORTED for a process we did not touch.
-    if let Some(refusal) = identity_refusal {
-        result.error_class = Some("PID_REUSED".into());
-        result.hint = Some(refusal);
+    // Kill refused on identity grounds: report why instead of letting the
+    // taxonomy invent TIMEOUT/ABORTED for a process we did not touch.
+    // `PID_REUSED` = the pid now belongs to someone else; `IDENTITY_UNVERIFIABLE`
+    // = this environment could not identify the pid at all (fail-closed: we
+    // signalled nothing).
+    if let Some(verdict) = identity_refusal {
+        result.error_class = Some(
+            match verdict {
+                IdentityVerdict::Unverifiable => "IDENTITY_UNVERIFIABLE",
+                _ => "PID_REUSED",
+            }
+            .into(),
+        );
+        result.hint = Some(verdict.describe());
         return result;
     }
     let recipe_maps = if spec.error_maps.is_empty() {
@@ -551,20 +560,58 @@ fn kill_tree(child: &Child, _grace: Duration) {
         .status();
 }
 
+/// Bounded grace for a freshly spawned child to `exec`, used by
+/// `verify_before_kill`; poll interval while waiting.
+const KILL_IDENTITY_SETTLE: Duration = Duration::from_millis(250);
+const KILL_IDENTITY_POLL: Duration = Duration::from_millis(10);
+
+/// `verify`, tolerant of the `fork` → `execve` window. Between the two the
+/// child still carries its *parent's* argv and environment (only `execve`
+/// installs ours), so the generation token is not observable yet: an abort or
+/// SIGINT landing in the first few hundred microseconds after spawn read a
+/// `TokenMismatch` and refused to kill a process that was perfectly ours —
+/// observed as a rare `PID_REUSED` from the immediate-abort test on ubuntu
+/// (its start epoch matches and only the token is missing, which is exactly
+/// this window).
+///
+/// Re-reading is safe: a recycled pid never acquires our random token, so the
+/// anti-pid-reuse guarantee is unchanged; a real child settles into a
+/// verifiable identity almost immediately. `Matches`, `NotRunning` and
+/// `Unverifiable` are returned as-is — only a mismatch is worth re-reading,
+/// and after `settle` the mismatch is reported (fail closed).
+fn verify_before_kill(identity: &ExpectedIdentity, settle: Duration) -> IdentityVerdict {
+    let deadline = Instant::now() + settle;
+    loop {
+        let verdict =
+            process_identity::verify(identity, process_identity::IDENTITY_EPOCH_TOLERANCE_MS);
+        match verdict {
+            IdentityVerdict::StartEpochMismatch { .. } | IdentityVerdict::TokenMismatch => {
+                if Instant::now() >= deadline {
+                    return verdict;
+                }
+                thread::sleep(KILL_IDENTITY_POLL);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Terminate the whole tree only after verifying the pid still refers to the
 /// process we spawned (generation token + start epoch — see
 /// `process_identity`). The existing tree-kill logic (SIGTERM → SIGKILL after
 /// grace on POSIX, taskkill on Windows) is unchanged; this only gates it.
 ///
-/// Returns `Err(description)` when the kill was refused because the pid was
-/// reused (classified `PID_REUSED` by the caller). `Ok` covers both "killed"
-/// and "already gone" (nothing to kill).
+/// Returns `Err(verdict)` when the kill was refused — the caller classifies it
+/// as `PID_REUSED` (a different process now holds the pid) or
+/// `IDENTITY_UNVERIFIABLE` (this environment can observe neither the start
+/// epoch nor the token, so nothing may be signalled). `Ok` covers both
+/// "killed" and "already gone" (nothing to kill).
 fn kill_tree_verified(
     child: &mut Child,
     grace: Duration,
     identity: &ExpectedIdentity,
-) -> Result<(), String> {
-    let verdict = process_identity::verify(identity, process_identity::IDENTITY_EPOCH_TOLERANCE_MS);
+) -> Result<(), IdentityVerdict> {
+    let verdict = verify_before_kill(identity, KILL_IDENTITY_SETTLE);
     match verdict {
         IdentityVerdict::Matches => {
             #[cfg(unix)]
@@ -574,9 +621,8 @@ fn kill_tree_verified(
             Ok(())
         }
         IdentityVerdict::NotRunning => Ok(()), // exited on its own — nothing to kill
-        IdentityVerdict::StartEpochMismatch { .. } | IdentityVerdict::TokenMismatch => {
-            Err(format!("PID_REUSED: {}", verdict.describe()))
-        }
+        IdentityVerdict::Unverifiable => Err(verdict),
+        IdentityVerdict::StartEpochMismatch { .. } | IdentityVerdict::TokenMismatch => Err(verdict),
     }
 }
 
@@ -674,8 +720,40 @@ mod tests {
         }
         let abort = AtomicBool::new(true); // pre-set: run must abort immediately
         let r = run_with_abort_streaming(&sh_ok("sleep 5"), &abort, None);
-        assert!(r.aborted);
-        assert_eq!(r.error_class.as_deref(), Some("ABORTED"));
+        assert!(r.aborted, "result: {:?}", r);
+        assert_eq!(r.error_class.as_deref(), Some("ABORTED"), "result: {:?}", r);
+    }
+
+    /// The identity gate must not refuse a child it cannot see *yet*: between
+    /// `fork` and `execve` the child still shows its parent's argv and
+    /// environment, so an abort landing immediately after spawn observes a
+    /// token-less command. That surfaced once as `PID_REUSED` instead of
+    /// `ABORTED` on the ubuntu runner.
+    #[test]
+    fn verify_before_kill_waits_out_the_fork_exec_window() {
+        if !process_identity::platform_probe_available() {
+            eprintln!("skipping: this environment cannot report process identities");
+            return;
+        }
+        // Our own process carries neither our random token nor its start epoch,
+        // so after the grace the refusal must still be the honest one: waiting
+        // must not turn a mismatch into a match.
+        let expected = ExpectedIdentity {
+            pid: std::process::id(),
+            generation_token: "ur-not-ours".into(),
+            start_epoch_ms: None,
+            token_observable: true,
+        };
+        let settle = Duration::from_millis(30);
+        let started = Instant::now();
+        assert_eq!(
+            verify_before_kill(&expected, settle),
+            IdentityVerdict::TokenMismatch
+        );
+        assert!(
+            started.elapsed() >= settle,
+            "the fork/exec grace was not honoured"
+        );
     }
 
     #[test]

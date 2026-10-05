@@ -1,6 +1,10 @@
 # unirun Session/Agent Adoption Plan
 
 Date: 2026-09-06
+Status: accepted — decision record. The MCP (`exec.*`, `session.*`) and ACP
+(`unirun acp`) surfaces below are shipped; LOS-gateway adoption is only
+partial (the gateway still routes remote `cwd`/`env` to its native runner).
+Delivery state lives in the README Roadmap.
 
 ## Decision
 

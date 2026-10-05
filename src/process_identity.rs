@@ -12,7 +12,9 @@
 //! - at kill time the observed identity must carry the token (when it is
 //!   observable on this platform) and match the snapshotted start epoch —
 //!   otherwise the pid was reused and the kill is refused (classified
-//!   `PID_REUSED`).
+//!   `PID_REUSED`). When *neither* signal is available the verdict is
+//!   `Unverifiable` (`IDENTITY_UNVERIFIABLE`): a probe-less environment must
+//!   not be mistaken for a verified identity.
 //!
 //! Zombies are not alive: a process in `Z` state has already exited and its
 //! pid is one step from reuse, so it is treated as gone (nothing to kill).
@@ -68,6 +70,11 @@ pub enum IdentityVerdict {
     StartEpochMismatch { observed: u64, expected: u64 },
     /// Running, but its command does not carry our generation token.
     TokenMismatch,
+    /// The pid exists, but this environment could observe neither a start
+    /// epoch (the probe failed at spawn) nor the generation token (not
+    /// observable for this kind of spawn), so nothing ties the pid to our run.
+    /// Callers must fail closed: never signal a pid we cannot identify.
+    Unverifiable,
 }
 
 impl IdentityVerdict {
@@ -82,6 +89,11 @@ impl IdentityVerdict {
             ),
             IdentityVerdict::TokenMismatch => {
                 "process command does not carry the run's generation token — the pid was reused"
+                    .to_string()
+            }
+            IdentityVerdict::Unverifiable => {
+                "process identity is unverifiable here: no start epoch was captured and the \
+                 command does not expose the generation token"
                     .to_string()
             }
         }
@@ -201,6 +213,17 @@ pub fn is_alive(pid: u32) -> bool {
     }
 }
 
+/// True when this environment can report process identities at all (start
+/// epoch and command). The probe shells out to `ps`/CIM, which some sandboxes
+/// and stripped-down containers block; the identity tests skip when it is
+/// unavailable instead of failing for a missing capability. Note that a
+/// `false` result also makes `verify` return `Unverifiable` for spawns whose
+/// token is not observable, which is a fail-closed refusal, not a silent match.
+#[cfg(test)]
+pub(crate) fn platform_probe_available() -> bool {
+    read_start_epoch_ms(std::process::id()).is_some()
+}
+
 /// True when the process exists but has already exited (POSIX zombie).
 /// Zombies are not alive: they cannot be signalled meaningfully and their
 /// pid is one step from reuse.
@@ -278,10 +301,17 @@ pub fn verify_identity(
             };
         }
     }
-    if expected.token_observable
-        && !command_carries_token(&observed.command, &expected.generation_token)
-    {
-        return IdentityVerdict::TokenMismatch;
+    if expected.token_observable {
+        if !command_carries_token(&observed.command, &expected.generation_token) {
+            return IdentityVerdict::TokenMismatch;
+        }
+    } else if expected.start_epoch_ms.is_none() {
+        // The token is not observable for this kind of spawn (Windows direct
+        // argv, Windows background sessions) and no start epoch was captured
+        // either — because the probe failed at spawn. There is nothing left to
+        // compare, so say so instead of reporting a match: the caller must not
+        // signal a pid it cannot tie to this run.
+        return IdentityVerdict::Unverifiable;
     }
     IdentityVerdict::Matches
 }
@@ -811,6 +841,39 @@ mod tests {
             ),
             IdentityVerdict::Matches
         );
+        // Token unobservable *and* no epoch captured (the probe failed at
+        // spawn): nothing ties the pid to the run. Reporting `Matches` here
+        // would let a recycled pid be signalled, so it must be `Unverifiable`
+        // — the callers refuse and say so instead of claiming PID_REUSED.
+        let nothing_to_check = ExpectedIdentity {
+            start_epoch_ms: None,
+            token_observable: false,
+            ..expected.clone()
+        };
+        assert_eq!(
+            verify_identity(
+                &nothing_to_check,
+                Some(identity(42, 1_000_000, "whatever")),
+                2_000,
+            ),
+            IdentityVerdict::Unverifiable
+        );
+        // A present-but-wrong epoch still wins: that is a real reuse signal.
+        assert_eq!(
+            verify_identity(
+                &ExpectedIdentity {
+                    start_epoch_ms: Some(1_000_000),
+                    token_observable: false,
+                    ..expected.clone()
+                },
+                Some(identity(42, 9_999_999, "whatever")),
+                2_000,
+            ),
+            IdentityVerdict::StartEpochMismatch {
+                observed: 9_999_999,
+                expected: 1_000_000,
+            }
+        );
     }
 
     #[test]
@@ -829,6 +892,10 @@ mod tests {
 
     #[test]
     fn self_start_epoch_is_stable_and_recent() {
+        if !platform_probe_available() {
+            eprintln!("skipping: this environment cannot report process start epochs");
+            return;
+        }
         let pid = std::process::id();
         let a = read_start_epoch_ms(pid).expect("our own start epoch");
         let b = read_start_epoch_ms(pid).expect("our own start epoch again");
@@ -867,6 +934,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawned_child_identity_carries_token() {
+        if !platform_probe_available() {
+            eprintln!("skipping: this environment cannot report process identities");
+            return;
+        }
         let token = generate_generation_token();
         let child = Command::new("sh")
             .arg("-c")
@@ -897,6 +968,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn zombie_process_is_not_alive() {
+        if !platform_probe_available() {
+            eprintln!("skipping: this environment cannot report process states");
+            return;
+        }
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             // Child: exit immediately without any Rust cleanup.

@@ -11,6 +11,11 @@
 //!                                    the process this run spawned; set
 //!                                    directly by the kill path, never
 //!                                    inferred from output evidence)
+//!   IDENTITY_UNVERIFIABLE            (kill refused — this environment could
+//!                                    observe neither the start epoch nor the
+//!                                    generation token, so the pid cannot be
+//!                                    tied to the run; fail-closed, also set
+//!                                    directly by the kill path)
 //!
 //! Matching order (first hit wins):
 //!   1. structural cases handled here (timeout / abort / POSIX exit codes)

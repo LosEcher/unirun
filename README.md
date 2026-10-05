@@ -54,7 +54,10 @@ unirun makes this matrix a solved, tested, shared problem:
   snapshotted; before terminating a process tree unirun verifies the pid still
   refers to that exact process. A recycled pid is refused (classified
   `PID_REUSED`) instead of mis-killing an innocent process, and zombies are
-  treated as already gone.
+  treated as already gone. When the environment exposes neither the start time
+  nor the token (blocked `ps`/CIM probe, Windows direct-argv spawn) the pid
+  cannot be tied to the run, so the kill is refused as
+  `IDENTITY_UNVERIFIABLE` rather than assumed safe.
 - **`unirun probe`** — the agent's first question answered: what shells,
   coreutils and tools actually exist here.
 
