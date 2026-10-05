@@ -93,7 +93,7 @@ RUN apk add --no-cache ca-certificates \
 Or from source (any platform, including macOS Intel):
 
 ```bash
-# From source (Rust 1.70+)
+# From source (Rust 1.88+ — see rust-version in Cargo.toml)
 cargo install unirun
 
 # Or build locally

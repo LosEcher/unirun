@@ -2,6 +2,9 @@
 name = "unirun"
 version = "0.3.0"
 edition = "2021"
+# Verified by `cargo +1.88.0 check --all-targets` and gated in CI (msrv job).
+# Drivers: `usize::is_multiple_of` (1.87) and `<[T]>::as_chunks` (1.88).
+rust-version = "1.88"
 description = "Cross-platform command execution normalization for AI agents — one command spec in, one normalized result out, on any platform."
 license = "MIT"
 repository = "https://github.com/LosEcher/unirun"

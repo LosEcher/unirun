@@ -18,7 +18,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, never `@stable`: a floating channel lets upstream lint additions
+      # turn `main` red with no code change (clippy 1.98 did exactly that).
+      # Keep in sync with rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy, rustfmt
       - name: Format check
@@ -31,6 +34,23 @@ jobs:
         run: cargo build --release
       - name: Test
         run: cargo test
+      - name: Test (winrm feature)
+        run: cargo test --features winrm
+
+  # MSRV gate: the version declared in `rust-version` must actually compile.
+  # The explicit `+1.88.0` matters — rust-toolchain.toml pins the default to
+  # 1.97.0, so a bare `cargo check` here would silently test the wrong compiler.
+  # The version banner is printed so such a fallback is visible in the log.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Check MSRV (Cargo.toml rust-version)
+        run: |
+          rustc +1.88.0 -V
+          cargo +1.88.0 -V
+          cargo +1.88.0 check --all-targets
 
   # Release assets follow a fixed `unirun-<os>-<arch>` naming contract so
   # consumers (Dockerfiles, install scripts, agent toolchains) can resolve the
@@ -73,7 +93,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: ${{ matrix.target }}
       - name: Build release binary (${{ matrix.target }})

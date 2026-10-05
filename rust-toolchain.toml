@@ -1,0 +1,8 @@
+# Pin the toolchain so the developer/agent gate and CI run the same rustc +
+# clippy. `stable` is not a version: when upstream added
+# `clippy::chunks_exact_to_as_chunks` (1.98) it turned `main` red for 29 days
+# while local 1.97 could not reproduce it. Bump this file and the pinned
+# version in `.github/workflows/ci.yml` together, in one commit.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
