@@ -51,13 +51,18 @@ unirun makes this matrix a solved, tested, shared problem:
   or exit codes. `--no-coalesce` disables it.
 - **Anti pid-reuse kill protection** — every child carries a random generation
   token (in its command line and environment) and its start time is
-  snapshotted; before terminating a process tree unirun verifies the pid still
-  refers to that exact process. A recycled pid is refused (classified
-  `PID_REUSED`) instead of mis-killing an innocent process, and zombies are
-  treated as already gone. When the environment exposes neither the start time
-  nor the token (blocked `ps`/CIM probe, Windows direct-argv spawn) the pid
-  cannot be tied to the run, so the kill is refused as
-  `IDENTITY_UNVERIFIABLE` rather than assumed safe.
+  snapshotted. A **detached** pid (a background-session runner, which outlives
+  whoever started it) is only signalled after the probe confirms it is still
+  that process: otherwise the kill is refused as `PID_REUSED`, or as
+  `IDENTITY_UNVERIFIABLE` when this environment can read neither the start
+  time nor the token (a blocked `ps`/CIM probe) — fail closed rather than
+  signal a pid that may belong to someone else. A child the caller still holds
+  **unreaped** needs no such gate and is never refused: POSIX keeps its pid
+  allocated until `wait` and Rust keeps the process handle open on Windows, so
+  the pid provably cannot be someone else's; when the probe cannot confirm it
+  the run says so in `hint` (`tree kill not identity-confirmed: …`) instead of
+  leaving the tree alive or claiming a reuse that never happened. Zombies are
+  treated as already gone.
 - **`unirun probe`** — the agent's first question answered: what shells,
   coreutils and tools actually exist here.
 

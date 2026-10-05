@@ -9,12 +9,15 @@
 //!   its command text (argv-visible on every platform, including Windows
 //!   `CommandLine`) and its environment (inherited by the whole tree);
 //! - the child's **start epoch** is snapshotted right after spawn;
-//! - at kill time the observed identity must carry the token (when it is
-//!   observable on this platform) and match the snapshotted start epoch —
-//!   otherwise the pid was reused and the kill is refused (classified
-//!   `PID_REUSED`). When *neither* signal is available the verdict is
-//!   `Unverifiable` (`IDENTITY_UNVERIFIABLE`): a probe-less environment must
-//!   not be mistaken for a verified identity.
+//! - at kill time the observation is compared against that snapshot. A
+//!   **detached** pid (a background-session runner, which outlives the process
+//!   that started it) is only signalled when the probe confirms it; otherwise
+//!   the kill is refused as `PID_REUSED` / `IDENTITY_UNVERIFIABLE`. A child the
+//!   caller still holds **unreaped** is signalled either way: its pid cannot
+//!   have been recycled (POSIX holds the pid until `wait`, Windows holds the
+//!   process handle until then), so the probe corroborates rather than gates —
+//!   see `exec::kill_gate`. [`observe_process`] keeps "gone" and "unreadable"
+//!   apart, so a blocked probe never reads as "the process is not there".
 //!
 //! Zombies are not alive: a process in `Z` state has already exited and its
 //! pid is one step from reuse, so it is treated as gone (nothing to kill).
@@ -208,8 +211,9 @@ pub fn is_alive(pid: u32) -> bool {
         // pid counted as alive, so a crashed background session never settled
         // as `interrupted` and `kill` saw no reason to stop. The process list
         // is the probe (one PowerShell call, the same cost macOS already pays
-        // for `ps`).
-        read_windows_identity(pid).is_some()
+        // for `ps`). An unanswerable probe counts as alive: a runner that
+        // cannot be inspected must not be reported as already gone.
+        !matches!(read_windows_observation(pid), Observed::Gone)
     }
 }
 
@@ -253,17 +257,54 @@ pub fn read_start_epoch_ms(pid: u32) -> Option<u64> {
     }
 }
 
-/// Read the full observable identity of `pid`. `None` when the process does
-/// not exist, is a zombie, or cannot be queried.
-pub fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
+/// What one observation of a pid saw.
+///
+/// Keeping `Gone` and `Unreadable` apart is the point: a sandboxed or
+/// stripped-down host can block the probe (`ps`, CIM) or deny access, and
+/// "I could not look" must never be reported as "it is not there". Callers
+/// then choose policy per path — see `exec::kill_gate` (a child we still hold
+/// unreaped is ours by construction, so it is signalled either way) versus
+/// `session::kill` (a detached runner is only ours if the probe says so, so an
+/// unreadable pid fails closed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observed {
+    /// The pid exists and its identity was read.
+    Alive(ProcessIdentity),
+    /// The pid does not exist (exited and reaped, or never existed).
+    Gone,
+    /// The pid may well exist, but this environment could not read its
+    /// identity: probe binary missing or blocked, permission denied, command
+    /// or environment unreadable, or a transient probe failure.
+    Unreadable,
+}
+
+/// Read the full observable identity of `pid`, keeping "gone" and "unreadable"
+/// apart. Prefer this over [`read_process_identity`] anywhere the difference
+/// changes what the caller does.
+pub fn observe_process(pid: u32) -> Observed {
+    if pid == 0 {
+        return Observed::Gone;
+    }
     #[cfg(unix)]
     {
-        if !is_alive(pid) {
-            return None;
+        // `kill(pid, 0)` is the one probe that is always available: it tells
+        // "exists" from "does not exist" with no external binary involved.
+        let signalable = unsafe { libc::kill(pid as i32, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !signalable {
+            return Observed::Gone;
         }
-        let start_epoch_ms = read_start_epoch_unix(pid)?;
-        let command = read_command(pid).unwrap_or_default();
-        Some(ProcessIdentity {
+        // A zombie cannot be signalled meaningfully and is one step from
+        // reuse. Where the state probe is unavailable this reads false and the
+        // identity reads below make the result `Unreadable` instead.
+        if is_zombie(pid) {
+            return Observed::Gone;
+        }
+        let (Some(start_epoch_ms), Some(command)) = (read_start_epoch_unix(pid), read_command(pid))
+        else {
+            return Observed::Unreadable;
+        };
+        Observed::Alive(ProcessIdentity {
             pid,
             start_epoch_ms,
             command,
@@ -271,26 +312,40 @@ pub fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
     }
     #[cfg(windows)]
     {
-        // `read_windows_identity` is itself the liveness probe on Windows;
-        // gating it behind `is_alive` first would shell out twice per read.
-        read_windows_identity(pid)
+        read_windows_observation(pid)
+    }
+}
+
+/// Read the full observable identity of `pid`. `None` when the process does
+/// not exist, is a zombie, or cannot be queried — callers that must act on the
+/// difference use [`observe_process`] instead.
+pub fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    match observe_process(pid) {
+        Observed::Alive(identity) => Some(identity),
+        Observed::Gone | Observed::Unreadable => None,
     }
 }
 
 /// Verify that `pid` still refers to the process we spawned.
 pub fn verify(expected: &ExpectedIdentity, tolerance_ms: u64) -> IdentityVerdict {
-    verify_identity(expected, read_process_identity(expected.pid), tolerance_ms)
+    verify_observation(expected, observe_process(expected.pid), tolerance_ms)
 }
 
-/// Pure decision over an observed identity (kept separate so the verdict
+/// Pure decision over one [`Observed`] reading (kept separate so the verdict
 /// logic is unit-testable without real processes).
-pub fn verify_identity(
+pub fn verify_observation(
     expected: &ExpectedIdentity,
-    observed: Option<ProcessIdentity>,
+    observed: Observed,
     tolerance_ms: u64,
 ) -> IdentityVerdict {
-    let Some(observed) = observed else {
-        return IdentityVerdict::NotRunning;
+    let observed = match observed {
+        // Not there any more — there is nothing to signal.
+        Observed::Gone => return IdentityVerdict::NotRunning,
+        // We could not look. That is neither "gone" nor "ours": say so and let
+        // the caller apply its policy (an owned, unreaped child is signalled
+        // anyway; a detached pid fails closed).
+        Observed::Unreadable => return IdentityVerdict::Unverifiable,
+        Observed::Alive(identity) => identity,
     };
     if let Some(expected_epoch) = expected.start_epoch_ms {
         let diff = observed.start_epoch_ms.abs_diff(expected_epoch);
@@ -314,6 +369,21 @@ pub fn verify_identity(
         return IdentityVerdict::Unverifiable;
     }
     IdentityVerdict::Matches
+}
+
+/// [`verify_observation`] for callers that already hold an optional identity:
+/// an absent identity reads as "gone". Production paths use [`verify`], which
+/// keeps "gone" and "unreadable" apart.
+pub fn verify_identity(
+    expected: &ExpectedIdentity,
+    observed: Option<ProcessIdentity>,
+    tolerance_ms: u64,
+) -> IdentityVerdict {
+    verify_observation(
+        expected,
+        observed.map_or(Observed::Gone, Observed::Alive),
+        tolerance_ms,
+    )
 }
 
 // --- platform identity queries ---
@@ -514,38 +584,59 @@ fn nul_join(bytes: &[u8]) -> String {
     s
 }
 
+/// Windows observation: the CIM query is the only probe available (no
+/// signal-0, no `/proc`). The script reports `GONE` explicitly when the pid
+/// has no row, so "no such process" stays distinct from "PowerShell/CIM could
+/// not answer" — conflating the two is what made a probe-less host look like a
+/// host where every process had already exited.
+///
+/// `EpochMs` is emitted directly: `CreationDate` is a PowerShell `DateTime`,
+/// and its JSON rendering is not the raw CIM string this code used to parse —
+/// Windows PowerShell 5.1 (what windows-latest runs) emits
+/// `/Date(1791162553132)/`, so every read returned `None` and the
+/// identity/liveness layer silently degraded. `CommandLine` can also be null
+/// for some processes, which must not read as "process gone".
 #[cfg(windows)]
-fn read_windows_identity(pid: u32) -> Option<ProcessIdentity> {
-    // Emit epoch milliseconds directly. `CreationDate` is a PowerShell
-    // `DateTime`, and its JSON rendering is not the raw CIM string this code
-    // used to parse: Windows PowerShell 5.1 (what windows-latest runs) emits
-    // `/Date(1791162553132)/`, so every Windows read returned `None` and the
-    // identity/liveness layer silently degraded. `CommandLine` can also be
-    // null for some processes, which must not read as "process gone".
+fn read_windows_observation(pid: u32) -> Observed {
     let script = format!(
         "$p=Get-CimInstance Win32_Process -Filter 'ProcessId = {}'; \
-         if ($null -ne $p) {{ \
+         if ($null -eq $p) {{ 'GONE' }} else {{ \
          $ms=[int64](($p.CreationDate.ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds); \
          @{{EpochMs=$ms;CommandLine=$p.CommandLine}} | ConvertTo-Json -Compress }}",
         pid
     );
-    let out = Command::new("powershell.exe")
+    let Ok(out) = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
-        .ok()?;
+    else {
+        return Observed::Unreadable; // no shell to ask with
+    };
     if !out.status.success() {
-        return None;
+        return Observed::Unreadable;
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let text = text.trim();
     if text.is_empty() {
-        return None;
+        // The query did not run at all; silence is not an answer.
+        return Observed::Unreadable;
     }
-    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if text == "GONE" {
+        return Observed::Gone;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Observed::Unreadable;
+    };
     let start_epoch_ms = match v.get("EpochMs").and_then(|n| n.as_i64()) {
         Some(ms) if ms >= 0 => ms as u64,
         // Older/alternate renderings still carry the creation stamp.
-        _ => parse_creation_date(v.get("CreationDate").and_then(|s| s.as_str())?)?,
+        _ => match v
+            .get("CreationDate")
+            .and_then(|s| s.as_str())
+            .and_then(parse_creation_date)
+        {
+            Some(ms) => ms,
+            None => return Observed::Unreadable,
+        },
     };
     let command = v
         .get("CommandLine")
@@ -553,11 +644,23 @@ fn read_windows_identity(pid: u32) -> Option<ProcessIdentity> {
         .unwrap_or_default()
         .trim()
         .to_string();
-    Some(ProcessIdentity {
+    Observed::Alive(ProcessIdentity {
         pid,
         start_epoch_ms,
         command,
     })
+}
+
+/// `Option` view of the Windows observation, for callers whose contract is
+/// `Option` (`read_start_epoch_ms`). Liveness callers use
+/// [`read_windows_observation`] directly so that "unreadable" does not read as
+/// "gone".
+#[cfg(windows)]
+fn read_windows_identity(pid: u32) -> Option<ProcessIdentity> {
+    match read_windows_observation(pid) {
+        Observed::Alive(identity) => Some(identity),
+        Observed::Gone | Observed::Unreadable => None,
+    }
 }
 
 /// Parse a creation stamp in either shape it reaches us: the raw CIM form
@@ -888,6 +991,45 @@ mod tests {
             token_observable: true,
         };
         assert_eq!(verify(&expected, 2_000), IdentityVerdict::NotRunning);
+    }
+
+    /// "Gone" and "unreadable" must not collapse into one another. A host that
+    /// cannot run the probe (a sandbox blocking `ps`, a container without CIM)
+    /// used to report every pid as gone, which silently turned tree-kills into
+    /// no-ops and let a timeout result claim it had terminated the tree.
+    #[test]
+    fn gone_and_unreadable_are_distinct_verdicts() {
+        // A pid beyond any real one needs no probe to rule out.
+        assert_eq!(observe_process(999_999_999), Observed::Gone);
+        assert_eq!(read_process_identity(999_999_999), None);
+
+        let expected = ExpectedIdentity {
+            pid: 999_999_999,
+            generation_token: "ur123".into(),
+            start_epoch_ms: Some(1),
+            token_observable: true,
+        };
+        assert_eq!(
+            verify_observation(&expected, Observed::Gone, 2_000),
+            IdentityVerdict::NotRunning
+        );
+        // Unreadable is neither gone nor ours: the caller applies its policy
+        // (a child we own unreaped is signalled; a detached pid is refused).
+        assert_eq!(
+            verify_observation(&expected, Observed::Unreadable, 2_000),
+            IdentityVerdict::Unverifiable
+        );
+        // …and it stays `Unverifiable` even when the token would not have been
+        // observable anyway: there is nothing to compare either way.
+        let nothing_observable = ExpectedIdentity {
+            start_epoch_ms: None,
+            token_observable: false,
+            ..expected.clone()
+        };
+        assert_eq!(
+            verify_observation(&nothing_observable, Observed::Unreadable, 2_000),
+            IdentityVerdict::Unverifiable
+        );
     }
 
     #[test]

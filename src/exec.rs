@@ -207,9 +207,11 @@ fn run_inner(
     let mut signal: Option<i32> = None;
     let mut timed_out = false;
     let mut aborted = false;
-    // Set when the tree-kill was refused because the pid no longer refers to
-    // the process we spawned (recycled pid) — the run reports PID_REUSED.
-    let mut identity_refusal: Option<IdentityVerdict> = None;
+    // Set when the tree-kill went ahead without the identity probe confirming
+    // the pid (unreadable probe, or a child that re-exec'd away its token).
+    // The kill still happens — see `kill_gate` — so this only annotates the
+    // result instead of replacing its classification.
+    let mut identity_unconfirmed: Option<IdentityVerdict> = None;
 
     // Deadline + abort polling loop.
     loop {
@@ -222,18 +224,12 @@ fn run_inner(
             Ok(None) => {
                 if abort.load(Ordering::SeqCst) {
                     aborted = true;
-                    if let Err(refusal) = kill_tree_verified(&mut child, grace, &identity) {
-                        identity_refusal = Some(refusal);
-                        let _ = child.wait();
-                    }
+                    identity_unconfirmed = kill_tree_of_owned_child(&mut child, grace, &identity);
                     break;
                 }
                 if start.elapsed() >= timeout {
                     timed_out = true;
-                    if let Err(refusal) = kill_tree_verified(&mut child, grace, &identity) {
-                        identity_refusal = Some(refusal);
-                        let _ = child.wait();
-                    }
+                    identity_unconfirmed = kill_tree_of_owned_child(&mut child, grace, &identity);
                     break;
                 }
                 thread::sleep(Duration::from_millis(5));
@@ -267,22 +263,6 @@ fn run_inner(
         truncated: stdout_trunc || stderr_trunc,
         shell_used: shell,
     };
-    // Kill refused on identity grounds: report why instead of letting the
-    // taxonomy invent TIMEOUT/ABORTED for a process we did not touch.
-    // `PID_REUSED` = the pid now belongs to someone else; `IDENTITY_UNVERIFIABLE`
-    // = this environment could not identify the pid at all (fail-closed: we
-    // signalled nothing).
-    if let Some(verdict) = identity_refusal {
-        result.error_class = Some(
-            match verdict {
-                IdentityVerdict::Unverifiable => "IDENTITY_UNVERIFIABLE",
-                _ => "PID_REUSED",
-            }
-            .into(),
-        );
-        result.hint = Some(verdict.describe());
-        return result;
-    }
     let recipe_maps = if spec.error_maps.is_empty() {
         None
     } else {
@@ -291,6 +271,16 @@ fn run_inner(
     let (class, hint) = classify_with_maps(&result, recipe_maps);
     result.error_class = class;
     result.hint = hint;
+    // The tree was signalled on the owned-child guarantee (see `kill_gate`),
+    // not on a verified pid: keep that visible instead of silently claiming
+    // the identity layer confirmed it.
+    if let Some(verdict) = identity_unconfirmed {
+        let note = format!("tree kill not identity-confirmed: {}", verdict.describe());
+        result.hint = Some(match result.hint.take() {
+            Some(existing) => format!("{}; {}", existing, note),
+            None => note,
+        });
+    }
     result
 }
 
@@ -566,19 +556,15 @@ const KILL_IDENTITY_SETTLE: Duration = Duration::from_millis(250);
 const KILL_IDENTITY_POLL: Duration = Duration::from_millis(10);
 
 /// `verify`, tolerant of the `fork` → `execve` window. Between the two the
-/// child still carries its *parent's* argv and environment (only `execve`
-/// installs ours), so the generation token is not observable yet: an abort or
-/// SIGINT landing in the first few hundred microseconds after spawn read a
-/// `TokenMismatch` and refused to kill a process that was perfectly ours —
-/// observed as a rare `PID_REUSED` from the immediate-abort test on ubuntu
-/// (its start epoch matches and only the token is missing, which is exactly
-/// this window).
+/// child still carries its *parent's* argv and environment — only `execve`
+/// installs ours — so the generation token is not observable yet and a read
+/// calls a perfectly owned child unconfirmed. A mismatch is therefore re-read
+/// for a bounded grace before it is believed; `Matches`, `NotRunning` and
+/// `Unverifiable` are returned as they are.
 ///
-/// Re-reading is safe: a recycled pid never acquires our random token, so the
-/// anti-pid-reuse guarantee is unchanged; a real child settles into a
-/// verifiable identity almost immediately. `Matches`, `NotRunning` and
-/// `Unverifiable` are returned as-is — only a mismatch is worth re-reading,
-/// and after `settle` the mismatch is reported (fail closed).
+/// This is what made the same window show up as a rare `PID_REUSED` on the
+/// ubuntu runner (start epoch matching, only the token missing) back when a
+/// mismatch was allowed to veto the kill.
 fn verify_before_kill(identity: &ExpectedIdentity, settle: Duration) -> IdentityVerdict {
     let deadline = Instant::now() + settle;
     loop {
@@ -596,33 +582,63 @@ fn verify_before_kill(identity: &ExpectedIdentity, settle: Duration) -> Identity
     }
 }
 
-/// Terminate the whole tree only after verifying the pid still refers to the
-/// process we spawned (generation token + start epoch — see
-/// `process_identity`). The existing tree-kill logic (SIGTERM → SIGKILL after
-/// grace on POSIX, taskkill on Windows) is unchanged; this only gates it.
+/// What to do about a tree-kill once the identity probe has reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillGate {
+    /// Signal the tree — identity confirmed.
+    Signal,
+    /// Signal the tree anyway, and report the verdict: the probe could not
+    /// confirm a child we hold unreaped, which is not a reason to leave a tree
+    /// running.
+    SignalUnconfirmed,
+    /// Do not signal: the pid is gone.
+    Skip,
+}
+
+/// Policy for the tree-kill gate (I/O lives in `kill_tree_of_owned_child`).
 ///
-/// Returns `Err(verdict)` when the kill was refused — the caller classifies it
-/// as `PID_REUSED` (a different process now holds the pid) or
-/// `IDENTITY_UNVERIFIABLE` (this environment can observe neither the start
-/// epoch nor the token, so nothing may be signalled). `Ok` covers both
-/// "killed" and "already gone" (nothing to kill).
-fn kill_tree_verified(
+/// This gate only ever handles a child **we still own**: it runs from the poll
+/// loop, which reaches it only when `try_wait()` reports the child unreaped.
+/// An unreaped child's pid cannot have been recycled — POSIX keeps a pid
+/// allocated until it is waited for, and Rust keeps the process handle open on
+/// Windows until then — so the probe is *corroboration, never a veto*:
+///
+/// - `NotRunning` → nothing to signal.
+/// - `Matches` → confirmed; signal.
+/// - anything else → signal and report. Refusing here is what turned a
+///   blocked probe (`ps` unavailable) into a silently skipped kill, and an
+///   immediately aborted run into a `PID_REUSED` claim about a pid that was
+///   never reused. A child that re-exec'd away its token (`env -i`, `exec`)
+///   or whose command cannot be read is still ours.
+fn kill_gate(verdict: &IdentityVerdict) -> KillGate {
+    match verdict {
+        IdentityVerdict::NotRunning => KillGate::Skip,
+        IdentityVerdict::Matches => KillGate::Signal,
+        IdentityVerdict::Unverifiable
+        | IdentityVerdict::StartEpochMismatch { .. }
+        | IdentityVerdict::TokenMismatch => KillGate::SignalUnconfirmed,
+    }
+}
+
+/// Terminate the tree of the child we own, per [`kill_gate`]. Returns the
+/// verdict to report when the probe did not confirm the identity, and `None`
+/// when it matched or there was nothing to kill.
+fn kill_tree_of_owned_child(
     child: &mut Child,
     grace: Duration,
     identity: &ExpectedIdentity,
-) -> Result<(), IdentityVerdict> {
+) -> Option<IdentityVerdict> {
     let verdict = verify_before_kill(identity, KILL_IDENTITY_SETTLE);
-    match verdict {
-        IdentityVerdict::Matches => {
-            #[cfg(unix)]
+    match kill_gate(&verdict) {
+        KillGate::Skip => None,
+        KillGate::Signal => {
             kill_tree(child, grace);
-            #[cfg(windows)]
-            kill_tree(child, grace);
-            Ok(())
+            None
         }
-        IdentityVerdict::NotRunning => Ok(()), // exited on its own — nothing to kill
-        IdentityVerdict::Unverifiable => Err(verdict),
-        IdentityVerdict::StartEpochMismatch { .. } | IdentityVerdict::TokenMismatch => Err(verdict),
+        KillGate::SignalUnconfirmed => {
+            kill_tree(child, grace);
+            Some(verdict)
+        }
     }
 }
 
@@ -789,6 +805,87 @@ mod tests {
         assert_eq!(r.error_class, None, "result: {:?}", r);
         assert_eq!(r.stdout, "unirun-default-shell\n", "result: {:?}", r);
         assert!(r.stderr.is_empty(), "stderr polluted: {:?}", r.stderr);
+    }
+
+    /// Policy pin for the tree-kill gate: the child is ours by construction
+    /// (we hold it unreaped, so its pid cannot have been recycled), therefore
+    /// only "gone" may skip the kill. A blocked probe or a child that re-exec'd
+    /// away its token must still be terminated — the verdict is reported.
+    #[test]
+    fn kill_gate_never_refuses_an_owned_child() {
+        assert_eq!(kill_gate(&IdentityVerdict::NotRunning), KillGate::Skip);
+        assert_eq!(kill_gate(&IdentityVerdict::Matches), KillGate::Signal);
+        let unconfirmed = [
+            IdentityVerdict::Unverifiable,
+            IdentityVerdict::TokenMismatch,
+            IdentityVerdict::StartEpochMismatch {
+                observed: 2,
+                expected: 1,
+            },
+        ];
+        for verdict in unconfirmed {
+            assert_eq!(
+                kill_gate(&verdict),
+                KillGate::SignalUnconfirmed,
+                "verdict: {:?}",
+                verdict
+            );
+        }
+    }
+
+    /// End to end: `exec env -i sleep 30` replaces the shell with a process
+    /// whose argv and environment carry no generation token, so the probe can
+    /// never confirm it. It is still our unreaped child, so the tree must die
+    /// and the run must report its real classification (TIMEOUT) with the
+    /// missing confirmation noted — not a `PID_REUSED` claim about a pid that
+    /// was never reused, and not a silently skipped kill.
+    #[cfg(unix)]
+    #[test]
+    fn cleared_environment_child_is_still_killed_and_reported() {
+        if which("bash").is_none() || which("env").is_none() {
+            return;
+        }
+        let marker = std::env::temp_dir().join(format!(
+            "unirun-killgate-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // `exec` keeps the pid, so the marker names the process that survives
+        // as `sleep` with an empty environment.
+        let mut spec = sh_ok(&format!(
+            "printf '%s' $$ > \"{}\"; exec env -i sleep 30",
+            marker.display()
+        ));
+        spec.timeout_ms = 700;
+        let r = run(&spec);
+        assert!(r.timed_out, "result: {:?}", r);
+        assert_eq!(r.error_class.as_deref(), Some("TIMEOUT"), "result: {:?}", r);
+        let hint = r.hint.clone().unwrap_or_default();
+        assert!(
+            hint.contains("not identity-confirmed"),
+            "expected an unconfirmed-identity note, got {:?} (result: {:?})",
+            hint,
+            r
+        );
+        let pid: u32 = std::fs::read_to_string(&marker)
+            .expect("child wrote its pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && process_identity::is_alive(pid) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let alive = process_identity::is_alive(pid);
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !alive,
+            "cleared-environment child {} survived the tree kill",
+            pid
+        );
     }
 
     #[test]

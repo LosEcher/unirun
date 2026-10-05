@@ -7,15 +7,19 @@
 //!   TIMEOUT · ABORTED · COMMAND_NOT_FOUND · PERMISSION · EXEC_FORMAT
 //!   NOT_FOUND · DEPENDENCY_MISSING · SYNTAX · UNKNOWN_FAILURE
 //!   NETWORK · COMPILE_ERROR          (added with the P2 error-map library)
-//!   PID_REUSED                       (kill refused — pid no longer refers to
-//!                                    the process this run spawned; set
-//!                                    directly by the kill path, never
-//!                                    inferred from output evidence)
+//!   PID_REUSED                       (kill refused — the pid no longer refers
+//!                                    to the process we started; set by the
+//!                                    background-session kill path, which
+//!                                    signals a pid it does not own, never
+//!                                    inferred from output evidence. `exec.run`
+//!                                    does not emit it: it signals the child it
+//!                                    still holds unreaped, whose pid cannot
+//!                                    have been recycled)
 //!   IDENTITY_UNVERIFIABLE            (kill refused — this environment could
 //!                                    observe neither the start epoch nor the
-//!                                    generation token, so the pid cannot be
-//!                                    tied to the run; fail-closed, also set
-//!                                    directly by the kill path)
+//!                                    generation token, so a detached pid could
+//!                                    not be tied to the session; fail-closed,
+//!                                    same path)
 //!
 //! Matching order (first hit wins):
 //!   1. structural cases handled here (timeout / abort / POSIX exit codes)

@@ -67,6 +67,16 @@ fn library_start_wait_output_roundtrip() {
 #[test]
 fn library_kill_terminates_long_run() {
     with_home("kill", |_| {
+        // A background runner is not this process's child (the session outlives
+        // whoever started it), so `kill` verifies the stored identity through
+        // the platform probe before signalling and refuses with
+        // IDENTITY_UNVERIFIABLE when the probe cannot answer (a sandbox that
+        // blocks `ps`, a Windows host where CIM is unavailable). Skipping here
+        // keeps that fail-closed behaviour from looking like a broken test.
+        if unirun::process_identity::read_start_epoch_ms(std::process::id()).is_none() {
+            eprintln!("skipping: this environment cannot report process identities");
+            return;
+        }
         let spec = unirun::spec::ExecSpec {
             command: long_cmd().into(),
             ..Default::default()

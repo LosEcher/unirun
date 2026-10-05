@@ -674,6 +674,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// A runner pid is not our child (the session outlives the process that
+    /// started it), so an identity that cannot be checked at all must fail
+    /// closed: refusing and naming the reason beats signalling a pid that may
+    /// belong to someone else. Windows sessions are exactly this shape
+    /// (`token_observable: false`) whenever the spawn-time epoch snapshot
+    /// failed.
+    #[test]
+    fn kill_refuses_unverifiable_identity() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = temp_home("killunver");
+        std::env::set_var("UNIRUN_HOME", &home);
+        let id = "unverifiablesession".to_string();
+        let dir = session_dir(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = SessionState {
+            id: id.clone(),
+            label: "unverifiable".into(),
+            status: "running".into(),
+            pid: Some(std::process::id()),
+            started_at: now_millis(),
+            finished_at: None,
+            exit_code: None,
+            error_class: None,
+            hint: None,
+            truncated: false,
+            truncated_log: false,
+            duration_ms: 0,
+            encoding: String::new(),
+            shell_used: String::new(),
+        };
+        write_json(&dir.join("state.json"), &state).unwrap();
+        // No start epoch and no observable token: nothing ties the pid to this
+        // session, so the verdict is `Unverifiable` whether or not the probe
+        // works — which makes this assertion environment-independent.
+        write_json(
+            &dir.join("identity.json"),
+            &SessionIdentity {
+                pid: std::process::id(),
+                generation_token: "ur-not-ours".into(),
+                start_epoch_ms: None,
+                token_observable: false,
+            },
+        )
+        .unwrap();
+        let err = kill(&id).unwrap_err();
+        assert!(err.contains("IDENTITY_UNVERIFIABLE"), "err: {}", err);
+        // Refused means nothing was signalled.
+        assert!(process_identity::is_alive(std::process::id()));
+        std::env::remove_var("UNIRUN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn kill_marks_not_running_session_interrupted() {
         let _guard = crate::ENV_TEST_LOCK
