@@ -304,12 +304,45 @@ extern "C" fn on_sigterm(_: libc::c_int) {
     crate::exec::signal_abort();
 }
 
+/// Grace period for a runner's terminal state to become visible after its pid
+/// is gone, and the poll step used while waiting for it.
+///
+/// The runner publishes `state.json` itself before exiting, so a dead pid with
+/// a still-`running` state is either (a) that write in flight or (b) a hard
+/// crash. The window is not academic: the liveness probe shells out to `ps` on
+/// macOS, which is wide enough for a fast command to finish and publish while
+/// `status()` is still deciding — that race reported a successful background
+/// command as `interrupted` (caught on macOS CI by
+/// `tests/mcp.rs::mcp_session_start_wait_output`).
+const RUNNER_SETTLE_GRACE: Duration = Duration::from_millis(1_000);
+const RUNNER_SETTLE_POLL: Duration = Duration::from_millis(20);
+
 /// Read the current state of a session (with stale-detection).
 pub fn status(id: &str) -> Result<SessionState, String> {
+    status_with_settle(id, true)
+}
+
+/// `settle = false` is the cheap path used by `list()`: it still re-reads
+/// before writing (so it can never clobber a terminal state) but never sleeps,
+/// keeping `bg list` fast no matter how many interrupted sessions exist.
+fn status_with_settle(id: &str, settle: bool) -> Result<SessionState, String> {
     let mut st = load_state(id)?;
     if st.status == "running" {
         if let Some(pid) = st.pid {
             if !pid_alive(pid) {
+                let deadline = Instant::now() + RUNNER_SETTLE_GRACE;
+                loop {
+                    let fresh = load_state(id)?;
+                    if fresh.is_terminal() {
+                        // The runner won the race: its verdict is authoritative.
+                        return Ok(fresh);
+                    }
+                    st = fresh;
+                    if !settle || Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(RUNNER_SETTLE_POLL);
+                }
                 st.status = "interrupted".into();
                 let finished_at = now_millis();
                 st.finished_at = Some(finished_at);
@@ -418,7 +451,7 @@ pub fn list() -> Vec<SessionState> {
                 continue;
             }
             if let Some(id) = path.file_name().and_then(|s| s.to_str()) {
-                if let Ok(mut st) = status(id) {
+                if let Ok(mut st) = status_with_settle(id, false) {
                     // re-check staleness was handled by status()
                     let _ = &mut st;
                     out.push(st);
@@ -655,6 +688,73 @@ mod tests {
         assert_eq!(st.status, "interrupted", "state: {:?}", st);
         assert!(st.finished_at.is_some());
         assert!(st.duration_ms > 0);
+        std::env::remove_var("UNIRUN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Regression: the runner publishes its own terminal state, and
+    /// stale-detection used to overwrite it with `interrupted` whenever the
+    /// runner finished during the liveness probe (macOS `ps` made that window
+    /// wide enough to lose reliably). A terminal write that lands while
+    /// `status` is waiting must win, both in the returned value and on disk.
+    #[test]
+    fn status_keeps_a_terminal_state_that_lands_during_stale_check() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = temp_home("settle");
+        std::env::set_var("UNIRUN_HOME", &home);
+        let id = "settlesession".to_string();
+        let dir = session_dir(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A "running" session whose runner pid is certainly gone.
+        let running = SessionState {
+            id: id.clone(),
+            label: "fake".into(),
+            status: "running".into(),
+            pid: Some(999_999_999),
+            started_at: now_millis().saturating_sub(1_000),
+            finished_at: None,
+            exit_code: None,
+            error_class: None,
+            hint: None,
+            truncated: false,
+            truncated_log: false,
+            duration_ms: 0,
+            encoding: String::new(),
+            shell_used: String::new(),
+        };
+        write_json(&dir.join("state.json"), &running).unwrap();
+
+        // Stand in for the runner: publish the real verdict shortly after
+        // stale-detection has already seen the dead pid.
+        let mut completed = running.clone();
+        completed.status = "completed".into();
+        completed.exit_code = Some(0);
+        completed.encoding = "utf-8".into();
+        let writer_dir = dir.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            completed.finished_at = Some(now_millis());
+            write_json(&writer_dir.join("state.json"), &completed).unwrap();
+        });
+
+        let st = status(&id).unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(
+            st.status, "completed",
+            "stale-detection clobbered the runner's verdict: {:?}",
+            st
+        );
+        assert_eq!(st.exit_code, Some(0));
+        assert_eq!(
+            load_state(&id).unwrap().status,
+            "completed",
+            "on-disk record must keep the runner's verdict"
+        );
+
         std::env::remove_var("UNIRUN_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
