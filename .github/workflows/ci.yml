@@ -24,6 +24,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy, rustfmt
+      # Without this every run recompiles the whole dependency graph on all three
+      # platforms — and this job builds *two* of them (default, then `winrm`, which
+      # pulls tokio + reqwest + rustls). Keyed on the toolchain and Cargo.lock, so a
+      # compiler or lockfile change starts a fresh cache instead of restoring a stale
+      # one; `cache-on-failure` keeps the saving even when a gate fails.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
@@ -46,6 +54,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Check MSRV (Cargo.toml rust-version)
         run: |
           rustc +1.88.0 -V
@@ -96,6 +107,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: ${{ matrix.target }}
+      # Same cache reasoning as the test job: five targets across three runners,
+      # all of them compiling the full dependency graph for a tag-time build.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # `--target <triple>` puts artifacts under target/<triple>, so the cache
+          # key has to include the triple or the five rows would share one entry.
+          key: ${{ matrix.target }}
       - name: Build dist binary (${{ matrix.target }})
         # Shipped assets come from the `dist` profile, where the size knobs live.
         # The test matrix above keeps plain `--release` for its compile check, and
