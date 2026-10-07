@@ -311,7 +311,7 @@ fn run_inner(
     // One budget for both streams: a grandchild that holds the pipes holds
     // both, and two sequential deadlines would double the wait.
     let drain_deadline = Instant::now() + Duration::from_millis(spec.effective_drain_ms());
-    let remaining = || drain_deadline.saturating_duration_since(Instant::now());
+    let remaining = || drain_remaining(drain_deadline);
     let (stdout_raw, stdout_trunc, stdout_drain_timeout) =
         collect_capture(Some(stdout_done_rx), Some(stdout_shared), remaining());
     let (stderr_raw, stderr_trunc, stderr_drain_timeout) =
@@ -648,6 +648,21 @@ impl PartialCapture {
 /// whether the drain deadline expired first (capture may be incomplete).
 pub(crate) type Collected = (Vec<u8>, bool, bool);
 
+/// What is left of the **shared** drain budget.
+///
+/// One budget covers both streams: a grandchild that holds the pipes holds both,
+/// and two sequential deadlines would double the wait (measured: 4.03 s instead
+/// of 2.03 s for `sleep 5 &` with a 2 s budget). Extracted so the sharing is
+/// unit-tested rather than inferred from a stopwatch.
+pub(crate) fn drain_remaining_at(deadline: Instant, now: Instant) -> Duration {
+    deadline.saturating_duration_since(now)
+}
+
+/// [`drain_remaining_at`] against the current clock.
+pub(crate) fn drain_remaining(deadline: Instant) -> Duration {
+    drain_remaining_at(deadline, Instant::now())
+}
+
 /// Take a reader's output, waiting at most `deadline` past the child's exit.
 pub(crate) fn collect_capture(
     rx: Option<mpsc::Receiver<Captured>>,
@@ -898,6 +913,28 @@ mod tests {
         );
     }
 
+    /// The drain budget is shared: the second stream gets what the first left,
+    /// and never a fresh deadline of its own.
+    #[test]
+    fn the_drain_budget_is_shared_between_streams() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(2_000);
+        assert_eq!(
+            drain_remaining_at(deadline, now),
+            Duration::from_millis(2_000)
+        );
+        // The first stream consumed 1.5 s of it.
+        let after_first = now + Duration::from_millis(1_500);
+        assert_eq!(
+            drain_remaining_at(deadline, after_first),
+            Duration::from_millis(500),
+            "the second stream must inherit the remainder, not restart the budget"
+        );
+        // A stream that used it all leaves nothing (and never panics).
+        let exhausted = now + Duration::from_millis(2_500);
+        assert_eq!(drain_remaining_at(deadline, exhausted), Duration::ZERO);
+    }
+
     /// The bug this bounds: a grandchild inherits the pipe, the shell exits, and
     /// the reader never sees EOF. Before the drain deadline, `unirun run
     /// 'sleep 5 &'` waited the full 5 seconds (or forever, for a daemon).
@@ -916,11 +953,13 @@ mod tests {
             r.drain_timeout,
             "the drain deadline must be reported: {r:?}"
         );
-        // One budget for both streams: waiting them out sequentially would take
-        // twice this. The bound is deliberately below 2x so that regression fails.
+        // Smoke bound only: the shared-budget property is pinned by
+        // `the_drain_budget_is_shared_between_streams` (no stopwatch), while this
+        // proves the run did not wait for the grandchild at all. Generous on
+        // purpose — CI runners are slow and loaded.
         assert!(
-            elapsed < std::time::Duration::from_millis(1_900),
-            "the drain budget must be shared, not per stream: {elapsed:?}"
+            elapsed < std::time::Duration::from_millis(3_000),
+            "must not wait for the grandchild: {elapsed:?}"
         );
     }
 

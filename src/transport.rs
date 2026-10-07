@@ -358,7 +358,7 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) ->
         target.drain_ms
     });
     let drain_deadline = Instant::now() + drain;
-    let remaining = || drain_deadline.saturating_duration_since(Instant::now());
+    let remaining = || crate::exec::drain_remaining(drain_deadline);
     let (out_bytes, out_truncated, out_drain_timeout) =
         crate::exec::collect_capture(Some(out_rx), Some(out_shared), remaining());
     let (err_bytes, err_truncated, err_drain_timeout) =
