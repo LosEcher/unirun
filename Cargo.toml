@@ -1,6 +1,6 @@
 [package]
 name = "unirun"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 # Verified by `cargo +1.88.0 check --all-targets` and gated in CI (msrv job).
 # Drivers: `usize::is_multiple_of` (1.87) and `<[T]>::as_chunks` (1.88).

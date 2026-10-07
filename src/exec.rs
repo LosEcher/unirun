@@ -125,9 +125,19 @@ pub fn run_streaming(spec: &ExecSpec, tx: mpsc::Sender<StreamChunk>) -> ExecResu
     run_inner(spec, &ABORT, Some(tx))
 }
 
+/// Run with a **caller-owned** abort flag.
+///
+/// The embedding API for a supervisor that already has its own cancellation
+/// (an agent loop, a policy layer): the flag is checked on the same 5 ms cadence
+/// as the process-wide SIGINT flag, and the tree is killed exactly as it is for
+/// a timeout. `ExecResult.aborted` reports which happened.
+pub fn run_with_abort(spec: &ExecSpec, abort: &AtomicBool) -> ExecResult {
+    run_inner(spec, abort, None)
+}
+
 /// Streaming variant with a caller-owned abort flag (per-session cancel,
 /// e.g. ACP `session/cancel`).
-pub(crate) fn run_with_abort_streaming(
+pub fn run_with_abort_streaming(
     spec: &ExecSpec,
     abort: &AtomicBool,
     tx: Option<mpsc::Sender<StreamChunk>>,

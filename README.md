@@ -173,6 +173,18 @@ Keys are added, never renamed or removed; `schema` changes only if the document
 shape does. A caller that misses a key it needs should fall back to its own
 precedent behaviour rather than assume the capability is absent.
 
+### Upgrading from 0.4.x
+
+Two things changed shape, both deliberate:
+
+- an unknown `--flag` is now a **usage error (exit 2)** instead of being appended
+  to the command or the remote script — that behaviour was indistinguishable from
+  script content and los kept a version table to work around it;
+- `ExecResult` gained `transport_error`, `transport_stderr`, `dispatched`,
+  `kill_status`, `exit_code_confidence` and `drain_timeout`; if 0.4.x code made a
+  claim that was not true, the 0.5.0 field that replaces it is named in
+  [CHANGELOG.md](CHANGELOG.md).
+
 ### MCP — plug into any agent
 
 `unirun mcp` is a stdio MCP server exposing `exec.run`, `exec.script`,
@@ -489,9 +501,47 @@ spawn itself.
   ControlMaster-disabled whole-tree deadline, Unix SSH integration tests.
 - **P4 (backlog)** — Windows local execution polish, session resume/replay,
   per-stream caps, recipe schema registry (semver'd), transport plugins.
+- **P5 (0.5.0)** — the cross-project audit's fixes: truthful `truncated` on every
+  transport, GBK/OEM decoding, bounded post-exit drain, `transport_error` /
+  `dispatched` / `kill_status` / `exit_code_confidence`, `capabilities --json`,
+  remote cancellation, MCP cancellation, `ssh --detach`, incremental `bg output`
+  cursors, three-state probe, `docs/PLATFORM-DIFFS.md`, stable library surface.
+  See [CHANGELOG.md](CHANGELOG.md) for the full list and the breaking changes.
 
 Independent by design: MCP + CLI only, no harness dependency, no telemetry,
 MIT licensed.
+
+## Library
+
+The CLI is a thin shell over the library, and both produce the same normalized
+result (`tests/lib_cli_parity.rs` asserts field-by-field equality):
+
+```rust
+use unirun::{ExecResult, ExecSpec, Shell};
+use std::sync::atomic::AtomicBool;
+
+let spec = ExecSpec {
+    command: "uv run pytest -q".into(),
+    shell: Some(Shell::Bash),
+    timeout_ms: 120_000,
+    output_encoding: Some("gbk".into()), // captured-output code page
+    ..Default::default()
+};
+let result: ExecResult = unirun::run(&spec);
+if result.timed_out || !result.dispatched {
+    // safe to resubmit; otherwise a non-idempotent command must not be retried
+}
+println!("{}", result.error_class.as_deref().unwrap_or("ok"));
+
+// Embedding with your own cancellation (an agent loop, a policy layer):
+let cancel = AtomicBool::new(false);
+let _ = unirun::run_with_abort(&spec, &cancel);
+```
+
+Stability: the `ExecSpec`/`ExecResult` field sets, `run*`, `ssh_run*`, `probe`,
+`session`, `recipe`, `capabilities`, `encoding` and the `error_class` vocabulary
+are the stable surface; fields are added, never removed or repurposed. See the
+[`unirun` crate docs](https://docs.rs/unirun) for the exact list.
 
 ## Releasing
 
