@@ -322,6 +322,13 @@ pub fn observe_process(pid: u32) -> Observed {
 /// Read the full observable identity of `pid`. `None` when the process does
 /// not exist, is a zombie, or cannot be queried — callers that must act on the
 /// difference use [`observe_process`] instead.
+///
+/// **A single read can land inside the `fork` → `execve` window**, where the
+/// child still carries its *parent's* argv and environment: the token is not
+/// there yet and the command line looks like the caller's. That is a property
+/// of the OS, not a flake — a caller that needs certainty must re-read for a
+/// bounded grace (see `verify_before_kill` in `exec.rs`, and
+/// `spawned_child_identity_carries_token` for the same retry in a test).
 pub fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
     match observe_process(pid) {
         Observed::Alive(identity) => Some(identity),
@@ -1091,12 +1098,32 @@ mod tests {
             .spawn()
             .expect("spawn sh");
         let pid = child.id();
+        // The read can land in the fork→execve window, where the child still
+        // carries this test binary's argv/env (measured on the ubuntu runner:
+        // `command did not carry token: ".../deps/unirun-… ACCEPT_EULA=…"`).
+        // That window is the reason the kill path re-reads for a bounded grace;
+        // do the same here instead of asserting on a single sample.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let observed = loop {
+            let observed = read_process_identity(pid).expect("child identity");
+            if command_carries_token(&observed.command, &token) {
+                break observed;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command never carried the token within the grace period: {:?}",
+                observed.command
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         let epoch = read_start_epoch_ms(pid).expect("child start epoch");
-        let observed = read_process_identity(pid).expect("child identity");
+        // The two independent reads must agree on who this is.
+        assert_eq!(observed.pid, pid);
         assert!(
-            command_carries_token(&observed.command, &token),
-            "command did not carry token: {:?}",
-            observed.command
+            observed.start_epoch_ms.abs_diff(epoch) <= 2_000,
+            "identity read and direct epoch read disagree: {} vs {}",
+            observed.start_epoch_ms,
+            epoch
         );
         let expected = ExpectedIdentity {
             pid,

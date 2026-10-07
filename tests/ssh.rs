@@ -50,12 +50,17 @@ fn ssh_transport_failure_is_classified() {
         r
     );
     assert_eq!(r.error_class.as_deref(), Some("TRANSPORT"));
+    // The client's wording is platform-specific: OpenSSH on Linux/macOS says
+    // `ssh: connect to host … Connection refused`, while the Windows client
+    // says `banner exchange: Connection to UNKNOWN port -1: Connection refused`.
+    // The contract is that the diagnostic is preserved and kept out of the
+    // remote's stderr — not that it uses one spelling.
     assert!(
-        r.transport_stderr
+        !r.transport_stderr
             .as_deref()
             .unwrap_or("")
-            .to_lowercase()
-            .contains("ssh"),
+            .trim()
+            .is_empty(),
         "the client's own diagnostic must be preserved: {:?}",
         r.transport_stderr
     );
