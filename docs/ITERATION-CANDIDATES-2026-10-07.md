@@ -46,7 +46,8 @@
 | A10 `capabilities --json` | ✅ 已完成 | 新增 `capabilities` 子命令 + MCP `exec.capabilities`（18 个稳定能力键，schema=1；`winrm` 随 feature 出现）；5 单测 + CLI/MCP 集成测试；README 增「Consumers: ask what the build can do」 |
 | A11 README 重试/unknown 语义 | ✅ 已完成 | README 增「Retry and "unknown" semantics」表（TRANSPORT/dispatched/TIMEOUT/ABORTED/PROCESS_UNKILLABLE/确定性类各自的处置）+「unknown = 未观测，不是失败」的口径 |
 | A5 `kill_status`/`exit_code_confidence` | ✅ 已完成 | 四态 `kill_status` + `exit_code_confidence` + taxonomy `PROCESS_UNKILLABLE`（"存活"优先于 TIMEOUT）；cmd 分支补 `exit /b %ERRORLEVEL%` 契约；真实「忽略 SIGTERM → sigkill-escalated」用例 + 状态机/置信度单测；E2E `trap '' TERM; sleep 30` 验证 |
-| A2–A4（ssh/winrm abort、MCP 取消、有界 drain） | ⏳ 待办 | |
+| A4 有界 drain | ✅ 已完成 | 每流 `PartialCapture` + 单次共享 drain 预算（默认 2s，`ExecSpec.drain_ms`），新增 `drain_timeout` 字段与 `drain-timeout` 能力键；本地与 ssh 两路都覆盖；真实「孙进程持有管道」用例（`sleep 5 &` 2.0s 返回而非 5s/永久） |
+| A2–A3（ssh/winrm abort、MCP 取消） | ⏳ 待办 | |
 | A6–A8、A12（会话/探测/平台差异） | ⏳ 待办 | |
 | A9 + 0.5.0 发布 | ⏳ 待办 | |
 

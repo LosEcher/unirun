@@ -12,12 +12,14 @@
 //! travels over stdin to `<shell> -s`, so no outer quoting layer can corrupt
 //! it, and the script's own exit code propagates exactly.
 
+use crate::exec::{Captured, PartialCapture};
 use crate::spec::{ExecResult, ExitCodeConfidence, KillStatus, Shell, DEFAULT_MAX_OUTPUT_BYTES};
 use crate::taxonomy::classify;
 use base64::Engine;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -73,6 +75,8 @@ pub struct SshTarget {
     /// Explicit code page for the captured output (`--output-encoding`).
     /// `None` = auto-detect (see `encoding::decode_with`).
     pub output_encoding: Option<String>,
+    /// Bounded drain after the ssh child exits, in ms; `0` → the shared default.
+    pub drain_ms: u64,
 }
 
 impl Default for SshTarget {
@@ -89,6 +93,7 @@ impl Default for SshTarget {
             env: Vec::new(),
             max_output_bytes: 0,
             output_encoding: None,
+            drain_ms: 0,
         }
     }
 }
@@ -281,8 +286,24 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) ->
     let so = child.stdout.take().unwrap();
     let se = child.stderr.take().unwrap();
     let max = output_cap(target);
-    let to = thread::spawn(move || read_capped(so, max));
-    let te = thread::spawn(move || read_capped(se, max));
+    let (out_tx, out_rx) = mpsc::channel::<Captured>();
+    let (err_tx, err_rx) = mpsc::channel::<Captured>();
+    let out_shared = PartialCapture::new();
+    let err_shared = PartialCapture::new();
+    {
+        let shared = out_shared.clone();
+        thread::spawn(move || {
+            let (bytes, truncated) = read_capped(so, max, &shared);
+            let _ = out_tx.send(Captured { bytes, truncated });
+        });
+    }
+    {
+        let shared = err_shared.clone();
+        thread::spawn(move || {
+            let (bytes, truncated) = read_capped(se, max, &shared);
+            let _ = err_tx.send(Captured { bytes, truncated });
+        });
+    }
 
     let timeout = Duration::from_millis(if target.timeout_ms == 0 {
         120_000
@@ -314,13 +335,26 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) ->
             }
         }
     }
-    let (out_bytes, out_truncated) = to.join().unwrap_or((Vec::new(), false));
-    let (err_bytes, err_truncated) = te.join().unwrap_or((Vec::new(), false));
+    // Bounded drain: a remote grandchild can hold the pipe after the ssh child
+    // is gone, exactly as locally.
+    let drain = std::time::Duration::from_millis(if target.drain_ms == 0 {
+        crate::spec::DEFAULT_DRAIN_MS
+    } else {
+        target.drain_ms
+    });
+    let drain_deadline = Instant::now() + drain;
+    let remaining = || drain_deadline.saturating_duration_since(Instant::now());
+    let (out_bytes, out_truncated, out_drain_timeout) =
+        crate::exec::collect_capture(Some(out_rx), Some(out_shared), remaining());
+    let (err_bytes, err_truncated, err_drain_timeout) =
+        crate::exec::collect_capture(Some(err_rx), Some(err_shared), remaining());
+    let drain_timeout = out_drain_timeout || err_drain_timeout;
     assemble_ssh_result(
         target,
         exit_code,
         timed_out,
         kill_status,
+        drain_timeout,
         StreamCapture {
             bytes: out_bytes,
             truncated: out_truncated,
@@ -359,6 +393,7 @@ fn assemble_ssh_result(
     exit_code: Option<i32>,
     timed_out: bool,
     kill_status: Option<KillStatus>,
+    drain_timeout: bool,
     stdout_capture: StreamCapture,
     stderr_capture: StreamCapture,
     duration_ms: u64,
@@ -405,6 +440,7 @@ fn assemble_ssh_result(
         dispatched,
         kill_status,
         exit_code_confidence: ExitCodeConfidence::Observed,
+        drain_timeout,
     };
     let (class, hint) = classify(&result);
     result.error_class = class;
@@ -558,7 +594,7 @@ fn filter_banner(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn read_capped<R: Read>(mut reader: R, max: usize) -> (Vec<u8>, bool) {
+fn read_capped<R: Read>(mut reader: R, max: usize, shared: &PartialCapture) -> (Vec<u8>, bool) {
     let mut tail: Vec<u8> = Vec::with_capacity(max.saturating_add(8192));
     let mut total = 0usize;
     let mut chunk = [0u8; 8192];
@@ -572,6 +608,7 @@ fn read_capped<R: Read>(mut reader: R, max: usize) -> (Vec<u8>, bool) {
                     let excess = tail.len() - max;
                     tail.drain(..excess);
                 }
+                shared.publish(&tail, total > max);
             }
             Err(_) => break,
         }
@@ -719,6 +756,7 @@ mod tests {
             env: Vec::new(),
             max_output_bytes: 0,
             output_encoding: None,
+            drain_ms: 0,
         }
     }
 
@@ -749,6 +787,7 @@ mod tests {
             Some(0),
             false,
             None,
+            false,
             capture(b"tail-of-stdout", true),
             capture(b"", false),
             7,
@@ -762,6 +801,7 @@ mod tests {
             Some(0),
             false,
             None,
+            false,
             capture(b"", false),
             capture(b"tail-of-stderr", true),
             3,
@@ -779,6 +819,7 @@ mod tests {
             None,
             true,
             None,
+            false,
             capture(b"partial", false),
             capture(b"", false),
             1,
@@ -801,6 +842,7 @@ mod tests {
             Some(255),
             false,
             None,
+            false,
             capture(b"", false),
             capture(
                 b"ssh: connect to host h.example port 22: Connection refused\n",
@@ -825,6 +867,7 @@ mod tests {
             Some(255),
             false,
             None,
+            false,
             capture(b"", false),
             capture(b"Permission denied (publickey).\n", false),
             4,
@@ -844,6 +887,7 @@ mod tests {
             Some(255),
             false,
             None,
+            false,
             capture(b"", false),
             capture(
                 b"Failed to connect to db port 5432: Connection refused\n",
@@ -867,6 +911,7 @@ mod tests {
             Some(255),
             false,
             None,
+            false,
             capture(b"", false),
             capture(
                 b"remote warning\nssh: connect to host h port 22: timed out\n",
@@ -892,6 +937,7 @@ mod tests {
             Some(255),
             true,
             None,
+            false,
             capture(b"", false),
             capture(b"ssh: connect to host h port 22: timed out\n", false),
             4,
@@ -923,6 +969,7 @@ mod tests {
             Some(255),
             false,
             None,
+            false,
             capture(b"", false),
             capture(
                 b"ssh: connect to host h port 22: Connection refused\n",
@@ -941,6 +988,7 @@ mod tests {
             Some(255),
             false,
             None,
+            false,
             capture(b"", false),
             capture(b"Permission denied (publickey).\n", false),
             4,
@@ -953,6 +1001,7 @@ mod tests {
             Some(255),
             false,
             None,
+            false,
             capture(b"", false),
             capture(b"Connection closed by 10.0.0.1 port 22\n", false),
             4,
@@ -969,6 +1018,7 @@ mod tests {
             Some(255),
             false,
             None,
+            false,
             capture(b"", false),
             capture(
                 b"ssh: connect to host h port 22: Connection refused\nConnection closed by 10.0.0.1\n",
@@ -984,6 +1034,7 @@ mod tests {
             Some(0),
             false,
             None,
+            false,
             capture(b"hi", false),
             capture(b"", false),
             2,
@@ -995,12 +1046,22 @@ mod tests {
     #[test]
     fn read_capped_reports_and_keeps_the_tail() {
         let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
-        let (tail, truncated) = read_capped(std::io::Cursor::new(data.clone()), 1024);
+        let shared = PartialCapture::new();
+        let (tail, truncated) = read_capped(std::io::Cursor::new(data.clone()), 1024, &shared);
         assert!(truncated);
         assert_eq!(tail.len(), 1024);
         assert_eq!(tail, &data[data.len() - 1024..]);
+        // The partial capture published the same tail, so a drain deadline has
+        // something to take even if the reader has not reached EOF.
+        let (published, published_truncated) = shared.snapshot();
+        assert_eq!(published, tail);
+        assert!(published_truncated);
 
-        let (all, not_truncated) = read_capped(std::io::Cursor::new(data.clone()), 20_000);
+        let (all, not_truncated) = read_capped(
+            std::io::Cursor::new(data.clone()),
+            20_000,
+            &PartialCapture::new(),
+        );
         assert!(!not_truncated);
         assert_eq!(all, data);
     }

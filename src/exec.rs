@@ -193,16 +193,30 @@ fn run_inner(
         CoalescePolicy::Custom(c) => Some(c),
     };
     let max = spec.effective_max_output();
-    let stdout_thread = child.stdout.take().map(|s| {
+    let (stdout_done_tx, stdout_done_rx) = mpsc::channel::<Captured>();
+    let (stderr_done_tx, stderr_done_rx) = mpsc::channel::<Captured>();
+    let stdout_shared = PartialCapture::new();
+    let stderr_shared = PartialCapture::new();
+    if let Some(s) = child.stdout.take() {
         let tx = tx.clone();
         let cfg = coalesce_cfg;
-        thread::spawn(move || read_capped_maybe_stream(s, max, StreamKind::Stdout, tx, cfg))
-    });
-    let stderr_thread = child.stderr.take().map(|s| {
+        let done = stdout_done_tx;
+        let shared = stdout_shared.clone();
+        thread::spawn(move || {
+            let c = read_capped_maybe_stream(s, max, StreamKind::Stdout, tx, cfg, shared);
+            let _ = done.send(c);
+        });
+    }
+    if let Some(s) = child.stderr.take() {
         let tx = tx.clone();
         let cfg = coalesce_cfg.filter(|c| c.coalesce_stderr);
-        thread::spawn(move || read_capped_maybe_stream(s, max, StreamKind::Stderr, tx, cfg))
-    });
+        let done = stderr_done_tx;
+        let shared = stderr_shared.clone();
+        thread::spawn(move || {
+            let c = read_capped_maybe_stream(s, max, StreamKind::Stderr, tx, cfg, shared);
+            let _ = done.send(c);
+        });
+    }
 
     let timeout = Duration::from_millis(spec.effective_timeout_ms());
     let grace = Duration::from_millis(spec.effective_grace_ms());
@@ -248,8 +262,17 @@ fn run_inner(
         }
     }
 
-    let (stdout_raw, stdout_trunc) = join_capture(stdout_thread);
-    let (stderr_raw, stderr_trunc) = join_capture(stderr_thread);
+    // Bounded drain: the child is gone, but a grandchild may still hold the
+    // pipe. Wait for the readers, but never forever.
+    // One budget for both streams: a grandchild that holds the pipes holds
+    // both, and two sequential deadlines would double the wait.
+    let drain_deadline = Instant::now() + Duration::from_millis(spec.effective_drain_ms());
+    let remaining = || drain_deadline.saturating_duration_since(Instant::now());
+    let (stdout_raw, stdout_trunc, stdout_drain_timeout) =
+        collect_capture(Some(stdout_done_rx), Some(stdout_shared), remaining());
+    let (stderr_raw, stderr_trunc, stderr_drain_timeout) =
+        collect_capture(Some(stderr_done_rx), Some(stderr_shared), remaining());
+    let drain_timeout = stdout_drain_timeout || stderr_drain_timeout;
     let stdout_decoded = decode_with(&stdout_raw, spec.output_encoding.as_deref());
     let stderr_decoded = decode_with(&stderr_raw, spec.output_encoding.as_deref());
     let stdout = crate::encoding::normalize_line_endings(&stdout_decoded.text);
@@ -275,6 +298,7 @@ fn run_inner(
         // terminated, not of the spec.
         kill_status: None,
         exit_code_confidence: ExitCodeConfidence::Observed,
+        drain_timeout,
     };
     let recipe_maps = if spec.error_maps.is_empty() {
         None
@@ -394,9 +418,9 @@ fn shell_argv(shell: Shell, spec: &ExecSpec, generation_token: &str) -> Vec<Stri
     }
 }
 
-struct Captured {
-    bytes: Vec<u8>,
-    truncated: bool,
+pub(crate) struct Captured {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
 }
 
 /// Read a stream to EOF, keeping only the **tail** `max` bytes but draining
@@ -412,6 +436,7 @@ fn read_capped_maybe_stream<R: Read>(
     kind: StreamKind,
     tx: Option<mpsc::Sender<StreamChunk>>,
     coalesce: Option<CoalesceConfig>,
+    shared: std::sync::Arc<PartialCapture>,
 ) -> Captured {
     let mut tail: Vec<u8> = Vec::with_capacity(max.saturating_add(8192));
     let mut total: usize = 0;
@@ -431,6 +456,7 @@ fn read_capped_maybe_stream<R: Read>(
                     let excess = tail.len() - max;
                     tail.drain(..excess);
                 }
+                shared.publish(&tail, total > max);
                 if let Some(d) = &mut dec {
                     let text = d.push(&chunk[..n]);
                     if !text.is_empty() {
@@ -538,16 +564,78 @@ impl IncrementalDecoder {
     }
 }
 
-fn join_capture(t: Option<thread::JoinHandle<Captured>>) -> (Vec<u8>, bool) {
-    match t {
-        Some(h) => {
-            let c = h.join().unwrap_or(Captured {
-                bytes: Vec::new(),
-                truncated: false,
-            });
-            (c.bytes, c.truncated)
+/// A reader thread's progress, shared with the main thread so a **drain
+/// deadline** can take what has arrived instead of blocking on EOF forever.
+///
+/// EOF is not guaranteed even after the direct child exits: a grandchild that
+/// inherited the pipe (`sleep 5 &`, a daemonised helper) keeps the write end
+/// open. Waiting for it used to hang unirun after its own kill — the failure
+/// mode Codex's exec kernel bounds with an IO drain timeout
+/// (CODEX-DSH-HARNESS-DESIGN-ANALYSIS-2026-08-21.md:248).
+pub(crate) struct PartialCapture {
+    bytes: std::sync::Mutex<Vec<u8>>,
+    truncated: std::sync::atomic::AtomicBool,
+}
+
+impl PartialCapture {
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(PartialCapture {
+            bytes: std::sync::Mutex::new(Vec::new()),
+            truncated: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Publish the tail kept so far (called after each read).
+    pub(crate) fn publish(&self, tail: &[u8], truncated: bool) {
+        if let Ok(mut buf) = self.bytes.lock() {
+            buf.clear();
+            buf.extend_from_slice(tail);
         }
-        None => (Vec::new(), false),
+        if truncated {
+            self.truncated
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> (Vec<u8>, bool) {
+        let bytes = self.bytes.lock().map(|b| b.clone()).unwrap_or_default();
+        (
+            bytes,
+            self.truncated.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+/// The result of collecting one stream: bytes, whether the cap was hit, and
+/// whether the drain deadline expired first (capture may be incomplete).
+pub(crate) type Collected = (Vec<u8>, bool, bool);
+
+/// Take a reader's output, waiting at most `deadline` past the child's exit.
+pub(crate) fn collect_capture(
+    rx: Option<mpsc::Receiver<Captured>>,
+    shared: Option<std::sync::Arc<PartialCapture>>,
+    deadline: Duration,
+) -> Collected {
+    let Some(rx) = rx else {
+        return (Vec::new(), false, false);
+    };
+    // Already finished (the common case, including "the other stream used up
+    // the shared drain budget"): take it without waiting.
+    match rx.try_recv() {
+        Ok(c) => return (c.bytes, c.truncated, false),
+        Err(mpsc::TryRecvError::Disconnected) => return (Vec::new(), false, false),
+        Err(mpsc::TryRecvError::Empty) => {}
+    }
+    match rx.recv_timeout(deadline) {
+        Ok(c) => (c.bytes, c.truncated, false),
+        Err(_) => match shared {
+            // Partial data, flagged: the caller must not read this as complete.
+            Some(shared) => {
+                let (bytes, truncated) = shared.snapshot();
+                (bytes, truncated, true)
+            }
+            None => (Vec::new(), false, true),
+        },
     }
 }
 
@@ -748,6 +836,41 @@ mod tests {
             shell: Some(Shell::Bash),
             ..Default::default()
         }
+    }
+
+    /// The bug this bounds: a grandchild inherits the pipe, the shell exits, and
+    /// the reader never sees EOF. Before the drain deadline, `unirun run
+    /// 'sleep 5 &'` waited the full 5 seconds (or forever, for a daemon).
+    #[cfg(unix)]
+    #[test]
+    fn a_grandchild_holding_the_pipe_does_not_hang_the_run() {
+        let mut spec = sh_ok("sleep 5 & echo started");
+        spec.drain_ms = 1_000;
+        let start = Instant::now();
+        let r = run(&spec);
+        let elapsed = start.elapsed();
+
+        assert_eq!(r.exit_code, Some(0), "{r:?}");
+        assert!(r.stdout.contains("started"), "stdout: {:?}", r.stdout);
+        assert!(
+            r.drain_timeout,
+            "the drain deadline must be reported: {r:?}"
+        );
+        // One budget for both streams: waiting them out sequentially would take
+        // twice this. The bound is deliberately below 2x so that regression fails.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_900),
+            "the drain budget must be shared, not per stream: {elapsed:?}"
+        );
+    }
+
+    /// The normal path is unaffected: EOF arrives, nothing is flagged, and the
+    /// capture is complete.
+    #[test]
+    fn a_normal_run_reports_no_drain_timeout() {
+        let r = run(&sh_ok("echo quick"));
+        assert!(!r.drain_timeout, "{r:?}");
+        assert_eq!(r.stdout, "quick\n");
     }
 
     /// A run that ignores SIGTERM must be reported as an escalated kill, not as

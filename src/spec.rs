@@ -69,6 +69,9 @@ pub enum ExecKind {
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const DEFAULT_GRACE_MS: u64 = 2_000;
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// How long to keep collecting a stream after the child exited. EOF is not
+/// guaranteed — a grandchild may hold the pipe — so the drain is bounded.
+pub const DEFAULT_DRAIN_MS: u64 = 2_000;
 
 /// Everything unirun needs to run one command or script.
 #[derive(Debug, Clone)]
@@ -106,6 +109,9 @@ pub struct ExecSpec {
     /// otherwise CP936/GBK when it decodes cleanly, else `utf-8-lossy`.
     /// Set from `--output-encoding` or recipe `[conventions] encoding`.
     pub output_encoding: Option<String>,
+    /// Bounded drain after the child exits, in ms; `0` → `DEFAULT_DRAIN_MS`.
+    /// Guards against a grandchild holding the pipe open forever.
+    pub drain_ms: u64,
 }
 
 impl Default for ExecSpec {
@@ -123,6 +129,7 @@ impl Default for ExecSpec {
             coalesce: CoalescePolicy::default(),
             error_maps: BTreeMap::new(),
             output_encoding: None,
+            drain_ms: 0,
         }
     }
 }
@@ -140,6 +147,13 @@ impl ExecSpec {
             DEFAULT_GRACE_MS
         } else {
             self.grace_ms
+        }
+    }
+    pub fn effective_drain_ms(&self) -> u64 {
+        if self.drain_ms == 0 {
+            DEFAULT_DRAIN_MS
+        } else {
+            self.drain_ms
         }
     }
     pub fn effective_max_output(&self) -> usize {
@@ -260,6 +274,9 @@ pub struct ExecResult {
     pub kill_status: Option<KillStatus>,
     /// Whether `exit_code` is evidence for the outcome.
     pub exit_code_confidence: ExitCodeConfidence,
+    /// True when the post-exit drain deadline expired before EOF: a process may
+    /// still be holding the pipe, and the captured output may be incomplete.
+    pub drain_timeout: bool,
 }
 
 impl ExecResult {
@@ -282,6 +299,7 @@ impl ExecResult {
             dispatched: true,
             kill_status: None,
             exit_code_confidence: ExitCodeConfidence::Observed,
+            drain_timeout: false,
         }
     }
 }

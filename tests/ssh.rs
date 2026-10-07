@@ -91,6 +91,7 @@ fn unix_target(shell: Shell) -> SshTarget {
         env: Vec::new(),
         max_output_bytes: 0,
         output_encoding: None,
+        drain_ms: 0,
     }
 }
 

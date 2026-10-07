@@ -172,6 +172,9 @@ pub fn winrm_run(target: &WinrmTarget, script: &str) -> ExecResult {
                 // The `$LASTEXITCODE` sentinel is an explicit contract, so the
                 // status it reports is evidence.
                 exit_code_confidence: ExitCodeConfidence::Observed,
+                // PSRP hands the whole stream over in memory: there is no pipe
+                // to drain.
+                drain_timeout: false,
             }
         }
         // The pipeline was submitted: PSRP may have executed part of it before

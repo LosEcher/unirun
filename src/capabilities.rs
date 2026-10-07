@@ -42,13 +42,16 @@ pub const FEATURE_KEYS: &[&str] = &[
     "winrm",           // only when the `winrm` feature is compiled in
     // Result-shape capabilities.
     "error-taxonomy",
-    "output-cap",      // --max-output, per stream, all transports
-    "truncation-flag", // `truncated` is truthful on every transport
-    "transport-error", // `transport_error` + `transport_stderr`
-    "dispatched",      // `dispatched`: did the command possibly run?
-    "legacy-codepage", // GBK auto-detection
-    "encoding-hint",   // --output-encoding / recipe [conventions] encoding
-    "strict-flags",    // unknown `--flags` are a usage error, never script text
+    "output-cap",           // --max-output, per stream, all transports
+    "truncation-flag",      // `truncated` is truthful on every transport
+    "transport-error",      // `transport_error` + `transport_stderr`
+    "dispatched",           // `dispatched`: did the command possibly run?
+    "kill-status",          // `kill_status`: clean / escalated / survived / unconfirmed
+    "exit-code-confidence", // `exit_code_confidence`: is a zero evidence?
+    "drain-timeout",        // `drain_timeout`: output may be incomplete
+    "legacy-codepage",      // GBK auto-detection
+    "encoding-hint",        // --output-encoding / recipe [conventions] encoding
+    "strict-flags",         // unknown `--flags` are a usage error, never script text
 ];
 
 #[derive(Debug, Serialize)]

@@ -152,7 +152,8 @@ version→feature table:
  "features":["local-exec","probe","mcp","acp","bg-session","recipe-registry",
              "recipe-toolchain","ssh","ssh-identity","ssh-workdir-env",
              "error-taxonomy","output-cap","truncation-flag","transport-error",
-             "dispatched","legacy-codepage","encoding-hint","strict-flags"]}
+             "dispatched","kill-status","exit-code-confidence","drain-timeout",
+             "legacy-codepage","encoding-hint","strict-flags"]}
 ```
 
 Keys are added, never renamed or removed; `schema` changes only if the document
@@ -378,6 +379,10 @@ and gone" are different claims:
   command failed". The ssh and WinRM paths do apply an exit contract (and the
   cmd path now appends `exit /b %ERRORLEVEL%`), so a non-zero status and every
   remote status stay `observed`.
+- `drain_timeout` — the post-exit drain deadline expired before the stream
+  reached EOF, which happens when a grandchild inherited the pipe (`sleep 5 &`,
+  a daemonised helper). The captured output may be incomplete, and unirun
+  deliberately stops waiting instead of hanging after the command is over.
 
 ### Retry and "unknown" semantics
 
