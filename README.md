@@ -501,7 +501,7 @@ spawn itself.
   ControlMaster-disabled whole-tree deadline, Unix SSH integration tests.
 - **P4 (backlog)** — Windows local execution polish, session resume/replay,
   per-stream caps, recipe schema registry (semver'd), transport plugins.
-- **P5 (0.5.0)** — the cross-project audit's fixes: truthful `truncated` on every
+- **P5 (released as 0.5.0)** — the cross-project audit's fixes: truthful `truncated` on every
   transport, GBK/OEM decoding, bounded post-exit drain, `transport_error` /
   `dispatched` / `kill_status` / `exit_code_confidence`, `capabilities --json`,
   remote cancellation, MCP cancellation, `ssh --detach`, incremental `bg output`

@@ -55,7 +55,7 @@
 | A6 远端会话（`ssh --detach`） | ✅ 已完成 | POSIX 远端脱附（`setsid` 优先/`nohup` 兜底、日志与 exit 码写远端文件、`$$` 记录 pid）；会话记录加 `RemoteSession`（含 host/pid/log/rc/身份参数），`bg status/output/output_since/kill` 走远端；Windows 目标明确 `UNSUPPORTED`+指路 schtasks；能力键 `ssh-detach`；单测 + 需真机的 ignored E2E |
 | A9 稳定 lib API + 0.5.0 发布 | ⏳ 待办 | |
 | A9 稳定 lib API | ✅ 已完成 | `lib.rs` 写明稳定面（字段只增不改）；`run_with_abort`/`run_with_abort_streaming` 提升为公开嵌入 API（自带取消标志）；新增 `tests/lib_cli_parity.rs`（5 例：成功/带证据失败/超时+kill_status/截断/调用方取消，逐字段比对 lib 与 CLI JSON） |
-| 0.5.0 发布准备 | ✅ 已完成（待人工两步） | 版本 0.4.0 → 0.5.0（Cargo.lock 同步）、新增 `CHANGELOG.md`（含 breaking 说明）、README 增 P5 路线行/`## Library`/「Upgrading from 0.4.x」；`cargo publish --dry-run` 通过、`cargo package --list` 37 个文件且无内部文件泄漏。**剩余人工步骤**：`scripts/release.sh`（8 道门禁，默认 dry-run，已验证全绿）→ `scripts/release.sh --push`（push main + tag，CI 出 5 资产）→ `cargo publish`（不可逆）。另记：0.5.0 的 `dist` 产物 1,087,536 B（0.4.0 为 872,224 B） |
+| **0.5.0 已发布** | ✅ 已完成 | **v0.5.0 三处一致**：tag `v0.5.0` = `Cargo.toml 0.5.0` = crates.io `max_version 0.5.0`。CI run `37572354684` 全绿（test×3 + msrv + release×5 + publish）；GitHub Release `v0.5.0` 挂 5 个资产（linux-x86_64 1,324,648 / linux-x86_64-musl 1,438,448 / linux-aarch64-musl 1,315,040 / macos-aarch64 1,087,504 / windows-x86_64.exe 1,366,528 B）。本机 `cargo install unirun --force`：0.3.0 → **0.5.0**（审计的「安装版落后仓内版」缺口关闭），smoke 五项通过（capabilities 24 keys / GBK→你好 / unknown flag exit 2 / ssh TRANSPORT+dispatched:false / --version 0.5.0）。发布过程由新增的 `scripts/release.sh` 驱动（8 道门禁，默认 dry-run）。两次 CI 迭代的教训已单独提交：打包门禁在 Windows 需 `shell: bash`（`b69ae21`）；两处测试的跨平台假设（Windows OpenSSH 的诊断措辞、fork→execve 窗口内的身份读取）已修正（`d59f052`） |
 
 ## 1. 口径：什么算「本项目范畴」
 
