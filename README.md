@@ -77,6 +77,11 @@ unirun makes this matrix a solved, tested, shared problem:
 - **`unirun probe`** — the agent's first question answered: what shells,
   coreutils and tools actually exist here.
 
+Each of those differences is written down in
+[docs/PLATFORM-DIFFS.md](docs/PLATFORM-DIFFS.md) with the witness it was learned
+from and the test that keeps it true — the file is a coverage claim, so a row
+whose test disappeared is a bug.
+
 ## Install
 
 Prebuilt binaries are attached to each [GitHub Release](https://github.com/LosEcher/unirun/releases).

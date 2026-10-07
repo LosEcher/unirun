@@ -28,6 +28,18 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Local PowerShell: the UTF-8 "golden recipe", so stdout and stderr are clean
+/// UTF-8 instead of CLIXML/OEM mojibake — the same normalization the SSH
+/// transport applies remotely.
+///
+/// Platform difference (Windows, PowerShell 5.1): **each setter must be
+/// try/catch-guarded**. In a no-console (piped) environment
+/// `[Console]::OutputEncoding` throws a non-terminating "handle is invalid"
+/// error that would otherwise land in the agent's stderr; and
+/// `$ProgressPreference` must be silenced because progress records are written
+/// to the same streams.
+pub(crate) const POWERSHELL_UTF8_RECIPE: &str = "$ProgressPreference='SilentlyContinue';try{[Console]::OutputEncoding=[Text.Encoding]::UTF8}catch{};try{$OutputEncoding=[Text.Encoding]::UTF8}catch{};";
+
 /// Set by the SIGINT handler; checked by the deadline loop.
 static ABORT: AtomicBool = AtomicBool::new(false);
 
@@ -422,13 +434,7 @@ fn shell_argv(shell: Shell, spec: &ExecSpec, generation_token: &str) -> Vec<Stri
             ]
         }
         Shell::Pwsh | Shell::Powershell => {
-            // Local PowerShell: inject the UTF-8 "golden recipe" so stdout and
-            // stderr are clean UTF-8 instead of CLIXML/OEM mojibake — the same
-            // normalization the SSH transport applies remotely. Each setter is
-            // try/catch-guarded: in a no-console (piped) environment,
-            // [Console]::OutputEncoding can throw a non-terminating "handle is
-            // invalid" error that would otherwise pollute stderr.
-            let recipe = "$ProgressPreference='SilentlyContinue';try{[Console]::OutputEncoding=[Text.Encoding]::UTF8}catch{};try{$OutputEncoding=[Text.Encoding]::UTF8}catch{};";
+            let recipe = POWERSHELL_UTF8_RECIPE;
             vec![
                 shell.as_str().to_string(),
                 "-NoProfile".into(),
@@ -1032,6 +1038,42 @@ mod tests {
             local_exit_code_confidence(&direct, &zero),
             ExitCodeConfidence::Observed
         );
+    }
+
+    /// Platform differences, part 3: every recipe setter is guarded, because an
+    /// unguarded `[Console]::OutputEncoding` throws "handle is invalid" when the
+    /// process has no console — and the throw lands in the agent's stderr.
+    /// Part 5: the recipe is applied to both PowerShell flavours, so a Windows
+    /// host never sees the CLIXML/OEM default.
+    #[test]
+    fn powershell_recipe_guards_every_setter() {
+        assert_eq!(
+            POWERSHELL_UTF8_RECIPE.matches("try{").count(),
+            2,
+            "both setters must be try/catch guarded: {POWERSHELL_UTF8_RECIPE}"
+        );
+        assert_eq!(POWERSHELL_UTF8_RECIPE.matches("catch{}").count(), 2);
+        assert!(POWERSHELL_UTF8_RECIPE.contains("$ProgressPreference='SilentlyContinue'"));
+        assert!(POWERSHELL_UTF8_RECIPE.contains("[Console]::OutputEncoding=[Text.Encoding]::UTF8"));
+        assert!(POWERSHELL_UTF8_RECIPE.contains("$OutputEncoding=[Text.Encoding]::UTF8"));
+
+        for shell in [Shell::Powershell, Shell::Pwsh] {
+            let spec = ExecSpec {
+                command: "Write-Output hi".into(),
+                shell: Some(shell),
+                ..Default::default()
+            };
+            let argv = shell_argv(shell, &spec, "TOKEN");
+            assert_eq!(argv[0], shell.as_str());
+            assert_eq!(argv[1], "-NoProfile");
+            assert_eq!(argv[2], "-Command");
+            assert!(
+                argv[3].starts_with(POWERSHELL_UTF8_RECIPE),
+                "{} must get the recipe first: {}",
+                shell.as_str(),
+                argv[3]
+            );
+        }
     }
 
     /// A spawn failure is the one local case where nothing ran, so a caller may

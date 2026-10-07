@@ -71,11 +71,10 @@ pub fn which(name: &str) -> Option<String> {
     None
 }
 
-/// `System32\bash.exe` on Windows is always the WSL shim.
-fn is_wsl_bash_shim(path: &Path) -> bool {
-    if !cfg!(windows) {
-        return false;
-    }
+/// `System32\bash.exe` on Windows is always the WSL launcher, never a real
+/// bash. Pure (the caller supplies `SystemRoot`) so the decision is testable on
+/// every platform, not only where the shim exists.
+fn is_wsl_bash_shim_for(path: &Path, system_root: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
@@ -84,22 +83,37 @@ fn is_wsl_bash_shim(path: &Path) -> bool {
     if name != "bash.exe" {
         return false;
     }
+    path.starts_with(system_root.join("System32"))
+}
+
+/// Platform-bound wrapper for [`is_wsl_bash_shim_for`].
+fn is_wsl_bash_shim(path: &Path) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
     let sys = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    path.starts_with(sys.join("System32"))
+    is_wsl_bash_shim_for(path, &sys)
 }
 
-/// Candidate filenames for a bare command name, platform-aware.
-fn executable_candidates(name: &str) -> Vec<String> {
+/// Candidate filenames for a bare command name.
+///
+/// Pure-form for tests: Windows resolves `python` through `python.exe` and
+/// friends because a PATH file-scan has to, unlike `CreateProcess`.
+fn executable_candidates_for(name: &str, windows: bool) -> Vec<String> {
     let mut v = vec![name.to_string()];
-    if cfg!(windows) && !name.contains('.') {
+    if windows && !name.contains('.') {
         v.push(format!("{}.exe", name));
         v.push(format!("{}.cmd", name));
         v.push(format!("{}.bat", name));
         v.push(format!("{}.ps1", name));
     }
     v
+}
+
+fn executable_candidates(name: &str) -> Vec<String> {
+    executable_candidates_for(name, cfg!(windows))
 }
 
 fn path_entries() -> Vec<PathBuf> {
@@ -173,10 +187,68 @@ fn is_gnu_coreutils(bin: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Platform differences, part 1 and 18: the shim decision and the extension
+    /// resolution are pure, so both are pinned on every OS (the Windows CI job
+    /// runs them too, against the same values).
+    #[test]
+    fn wsl_shim_and_extension_rules_are_platform_facts() {
+        let sys = Path::new(r"C:\Windows");
+        assert!(is_wsl_bash_shim_for(
+            &sys.join("System32").join("bash.exe"),
+            sys
+        ));
+        // Real Git Bash, a differently-named shim, and a decoy outside System32.
+        assert!(!is_wsl_bash_shim_for(
+            Path::new(r"C:\Program Files\Git\bin\bash.exe"),
+            sys
+        ));
+        assert!(!is_wsl_bash_shim_for(
+            &sys.join("System32").join("sh.exe"),
+            sys
+        ));
+        assert!(!is_wsl_bash_shim_for(Path::new(r"D:\tools\bash.exe"), sys));
+        // Case-insensitive, as Windows paths are.
+        assert!(is_wsl_bash_shim_for(
+            &sys.join("System32").join("BASH.EXE"),
+            sys
+        ));
+
+        // Windows resolves bare names through executable extensions; POSIX does
+        // not (and must not, or `python` would look for `python.exe`).
+        let win = executable_candidates_for("python", true);
+        assert_eq!(
+            win,
+            vec![
+                "python",
+                "python.exe",
+                "python.cmd",
+                "python.bat",
+                "python.ps1"
+            ]
+        );
+        assert_eq!(executable_candidates_for("python", false), vec!["python"]);
+        // A name that already carries an extension is left alone.
+        assert_eq!(executable_candidates_for("run.cmd", true), vec!["run.cmd"]);
+    }
+
     #[test]
     fn probe_shape() {
         let caps = probe();
         assert!(caps.platform == "macos" || caps.platform == "linux" || caps.platform == "windows");
+        // Platform differences, part 18: the platform comes from the compiler's
+        // target, never from running `uname` — Windows OpenSSH has no `uname`,
+        // and its absence used to be reported as a GBK error string instead of
+        // "unsupported".
+        assert_eq!(
+            caps.platform,
+            match std::env::consts::OS {
+                "macos" => "macos",
+                "linux" => "linux",
+                "windows" => "windows",
+                other => other,
+            }
+        );
+        assert_eq!(caps.arch, std::env::consts::ARCH);
         assert!(!caps.shells.is_empty());
         // Every supported host must expose at least one native shell.
         let has_native = if cfg!(windows) {

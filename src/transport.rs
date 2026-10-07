@@ -205,7 +205,7 @@ fn ssh_powershell(target: &SshTarget, script: &str) -> ExecResult {
     } else {
         "powershell.exe"
     };
-    let payload = format!("{}{}{}", GOLDEN_PREFIX, script.trim_end(), EXIT_CONTRACT);
+    let payload = ps_payload(script);
     let b64 = base64_utf16le(&payload);
     if inline_encoded_command_fits(b64.len()) {
         let remote_cmd = format!("{} -NoProfile -NonInteractive -EncodedCommand {}", exe, b64);
@@ -213,9 +213,7 @@ fn ssh_powershell(target: &SshTarget, script: &str) -> ExecResult {
     } else {
         // Large payload: scp a UTF-8-BOM temp .ps1, run with -File, clean up.
         let remote_path = format!(r"C:\Windows\Temp\unirun-{}.ps1", nonce());
-        let mut bytes = vec![0xEF, 0xBB, 0xBF]; // UTF-8 BOM: PS 5.1 parses UTF-8 correctly
-        bytes.extend_from_slice(payload.as_bytes());
-        let uploaded = upload_scp(target, &remote_path, &bytes);
+        let uploaded = upload_scp(target, &remote_path, &ps_file_payload(&payload));
         if let Err(e) = uploaded {
             return upload_failed(exe, e);
         }
@@ -558,6 +556,26 @@ fn upload_scp(target: &SshTarget, remote_path: &str, bytes: &[u8]) -> std::io::R
     } else {
         Err(std::io::Error::other("scp exited non-zero"))
     }
+}
+
+/// The PowerShell payload: golden recipe, the script, then the exit contract.
+///
+/// This string is never interpolated into a command line; it travels base64
+/// (`-EncodedCommand`) or as a UTF-8-BOM file, which is what keeps cmd.exe from
+/// eating `>` before PowerShell sees it (platform difference, part 16).
+fn ps_payload(script: &str) -> String {
+    format!("{}{}{}", GOLDEN_PREFIX, script.trim_end(), EXIT_CONTRACT)
+}
+
+/// The scp fallback's bytes: UTF-8 **with BOM**.
+///
+/// Platform difference, part 17: PowerShell 5.1 parses a `.ps1` as ANSI unless
+/// it starts with a BOM, so a script containing Chinese comments would fail to
+/// parse remotely without these three bytes.
+fn ps_file_payload(payload: &str) -> Vec<u8> {
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(payload.as_bytes());
+    bytes
 }
 
 fn base64_utf16le(text: &str) -> String {
@@ -1096,6 +1114,53 @@ mod tests {
         );
         assert!(!not_truncated);
         assert_eq!(all, data);
+    }
+
+    /// Platform differences, 16 and 17: the payload never appears literally in
+    /// the remote command (cmd.exe would eat `>`), and the scp fallback carries
+    /// the UTF-8 BOM PowerShell 5.1 needs to parse non-ASCII scripts.
+    #[test]
+    fn powershell_payload_is_encoded_and_bom_prefixed() {
+        let script = "Get-Date > $null; Write-Output '中文'";
+        let payload = ps_payload(script);
+        assert!(payload.starts_with(GOLDEN_PREFIX));
+        assert!(payload.ends_with(EXIT_CONTRACT));
+        assert!(payload.contains(script));
+
+        let b64 = base64_utf16le(&payload);
+        for meta in ['>', '<', '|', '&', '"', '\''] {
+            assert!(
+                !b64.contains(meta),
+                "base64 must carry no shell metacharacter, found {meta:?}"
+            );
+        }
+        // Round-trip: UTF-16LE, so decode as such.
+        let mut units: Vec<u16> = Vec::new();
+        let raw = {
+            use base64::engine::general_purpose::STANDARD;
+            STANDARD.decode(&b64).unwrap()
+        };
+        for pair in raw.chunks_exact(2) {
+            units.push(u16::from_le_bytes([pair[0], pair[1]]));
+        }
+        assert_eq!(String::from_utf16(&units).unwrap(), payload);
+
+        let file = ps_file_payload(&payload);
+        assert_eq!(&file[..3], &[0xEF, 0xBB, 0xBF], "PS 5.1 needs the BOM");
+        assert_eq!(&file[3..], payload.as_bytes());
+    }
+
+    /// The batch payload ends with the cmd exit contract (A5/A14 follow-up):
+    /// win-exec did this and unirun did not, so a trailing cmd statement could
+    /// reset the errorlevel and make the status meaningless.
+    #[test]
+    fn cmd_payload_appends_the_exit_contract() {
+        let p = String::from_utf8(cmd_payload("echo hi")).unwrap();
+        assert!(p.starts_with("echo hi\r\n"));
+        assert!(p.ends_with("exit /b %ERRORLEVEL%\r\n"));
+        // Idempotent enough: an existing trailing newline is not doubled.
+        let p2 = String::from_utf8(cmd_payload("echo hi\n\n")).unwrap();
+        assert_eq!(p, p2);
     }
 
     /// The threshold must leave room for the `-EncodedCommand` prefix inside
