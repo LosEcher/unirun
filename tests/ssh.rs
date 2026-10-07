@@ -232,3 +232,95 @@ fn ssh_abort_cancels_the_remote_run() {
         "json mode exits 0 when unirun ran"
     );
 }
+
+/// Detached POSIX runs: `ssh --detach` must return a session whose status,
+/// output and kill all work through the remote handles, and the run must
+/// outlive the ssh session that started it.
+///
+/// `#[ignore]`: needs a reachable POSIX host
+/// (`UNIRUN_TEST_SSH_HOST=<host> cargo test -- --ignored`).
+#[test]
+#[ignore]
+fn ssh_detach_survives_and_is_pollable() {
+    use std::process::Command;
+    let host = std::env::var("UNIRUN_TEST_SSH_HOST").unwrap_or_else(|_| "localhost".into());
+    let bin = env!("CARGO_BIN_EXE_unirun");
+
+    // A run that finishes on its own, including its exit status.
+    let out = Command::new(bin)
+        .args([
+            "ssh",
+            &host,
+            "echo detached-ok; exit 7",
+            "--shell",
+            "bash",
+            "--detach",
+            "--json",
+        ])
+        .output()
+        .expect("ssh --detach");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let state: serde_json::Value = serde_json::from_slice(&out.stdout).expect("session JSON");
+    let id = state["id"].as_str().expect("session id").to_string();
+    assert!(
+        state["remote"]["pid"].as_u64().is_some(),
+        "a detached session must record the remote pid: {state}"
+    );
+
+    // Poll until the remote script has recorded its exit status.
+    let mut status = String::new();
+    for _ in 0..40 {
+        let out = Command::new(bin)
+            .args(["bg", "status", &id, "--json"])
+            .output()
+            .expect("bg status");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        status = v["status"].as_str().unwrap_or("").to_string();
+        if status != "running" {
+            assert_eq!(v["exit_code"], serde_json::json!(7), "state: {v}");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert_eq!(status, "failed", "exit 7 is a failure, not a completion");
+
+    let out = Command::new(bin)
+        .args(["bg", "output", &id, "--since", "0", "--json"])
+        .output()
+        .expect("bg output");
+    let page: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        page["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("detached-ok"),
+        "remote log must be readable: {page}"
+    );
+    assert!(page["next_cursor"].as_u64().unwrap_or(0) > 0);
+
+    // A run that must be stopped from here.
+    let out = Command::new(bin)
+        .args([
+            "ssh",
+            &host,
+            "sleep 300",
+            "--shell",
+            "bash",
+            "--detach",
+            "--json",
+        ])
+        .output()
+        .expect("ssh --detach (long)");
+    let long: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let long_id = long["id"].as_str().unwrap().to_string();
+    let out = Command::new(bin)
+        .args(["bg", "kill", &long_id, "--json"])
+        .output()
+        .expect("bg kill");
+    let killed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(killed["status"], serde_json::json!("killed"), "{killed}");
+}

@@ -52,7 +52,8 @@
 | A12 `PLATFORM-DIFFS.md` | ✅ 已完成 | 新增 `docs/PLATFORM-DIFFS.md`：21 条平台事实 + 各自的证据出处与**测试名**（36 个引用，逐一核对存在；2 个 `[win]` 标注为仅 Windows 编译）；为原先无覆盖的 5 条补了测试（WSL shim 判定、Windows 扩展名解析、PS 配方 try/catch、payload base64/BOM、cmd 退出契约、probe 平台来源） |
 | A8 probe 三态 | ✅ 已完成 | `ProbeState::{Found,Absent,Unreadable}` + 每项 `state` + `Capabilities.unreadable` 覆盖率列表；`which_state`/`scan_dirs`/`scan_one`（纯函数，用 chmod 000 目录验证 unreadable 分支）；probe 人读输出显示 `(absent)`/`(unreadable)`；能力键 `probe-state` |
 | A7 bg 增量游标 | ✅ 已完成 | `session::output_since` + `OutputPage{next_cursor,reset,truncated_log}`；CLI `bg output --since N`、MCP `session.output` 的 `cursor` 参数；日志 append-only 不轮转 ⇒ 偏移稳定；能力键 `session-cursor`；含「不重复/不丢字符/陈旧游标 reset」集成测试 |
-| A6 远端会话（`ssh --detach`） | ⏳ 待办 | |
+| A6 远端会话（`ssh --detach`） | ✅ 已完成 | POSIX 远端脱附（`setsid` 优先/`nohup` 兜底、日志与 exit 码写远端文件、`$$` 记录 pid）；会话记录加 `RemoteSession`（含 host/pid/log/rc/身份参数），`bg status/output/output_since/kill` 走远端；Windows 目标明确 `UNSUPPORTED`+指路 schtasks；能力键 `ssh-detach`；单测 + 需真机的 ignored E2E |
+| A9 稳定 lib API + 0.5.0 发布 | ⏳ 待办 | |
 | A9 + 0.5.0 发布 | ⏳ 待办 | |
 
 ## 1. 口径：什么算「本项目范畴」

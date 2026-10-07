@@ -51,6 +51,106 @@ pub struct SessionState {
     pub duration_ms: u64,
     pub encoding: String,
     pub shell_used: String,
+    /// Set when this session is a **detached remote run** (`unirun ssh
+    /// --detach`): the remote side owns the process, the log and the exit
+    /// status, and the local record only remembers where to look.
+    #[serde(default)]
+    pub remote: Option<RemoteSession>,
+}
+
+/// The handles a detached remote run needs to be polled later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSession {
+    pub host: String,
+    pub shell: String,
+    /// Remote process-group leader (the script's own pid).
+    pub pid: u32,
+    /// Remote log file; stdout and stderr are merged into it.
+    pub log: String,
+    /// Remote file holding the exit status once the script finishes.
+    pub rc_file: String,
+    pub script_file: String,
+    /// SSH identity, so a later `bg status/output/kill` can reconnect exactly.
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    pub identity_file: Option<String>,
+    pub connect_timeout: u64,
+    pub timeout_ms: u64,
+    pub max_output_bytes: usize,
+    pub output_encoding: Option<String>,
+}
+
+impl RemoteSession {
+    /// Rebuild the ssh target for polling this run.
+    pub fn target(&self) -> crate::transport::SshTarget {
+        crate::transport::SshTarget {
+            host: self.host.clone(),
+            shell: crate::spec::Shell::from_name(&self.shell).unwrap_or(crate::spec::Shell::Sh),
+            timeout_ms: self.timeout_ms,
+            connect_timeout: self.connect_timeout,
+            user: self.user.clone(),
+            port: self.port,
+            identity_file: self.identity_file.clone().map(std::path::PathBuf::from),
+            workdir: None,
+            env: Vec::new(),
+            max_output_bytes: self.max_output_bytes,
+            output_encoding: self.output_encoding.clone(),
+            drain_ms: 0,
+        }
+    }
+
+    /// Has the remote run finished, and with what status?
+    ///
+    /// One ssh round-trip answers both questions: the rc file wins when it
+    /// exists, otherwise `kill -0` says whether the process is still there.
+    pub fn probe(&self) -> RemoteProbe {
+        let script = format!(
+            "if [ -s {rc} ]; then cat {rc}; elif kill -0 {pid} 2>/dev/null; then echo {running}; else echo {no_rc}; fi",
+            rc = posix_quote(&self.rc_file),
+            pid = self.pid,
+            running = REMOTE_RUNNING,
+            no_rc = REMOTE_NO_RC,
+        );
+        let r = crate::transport::ssh_run(&self.target(), &script);
+        classify_remote_probe(&r.stdout)
+    }
+}
+
+/// What one remote probe established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteProbe {
+    Running,
+    /// Finished, with the script's own exit status.
+    Exited(i32),
+    /// Gone, but no exit status was recorded: it was killed, or the host
+    /// rebooted. Reported as `interrupted` rather than guessed.
+    Vanished,
+    /// The probe itself failed (transport error).
+    Unreachable,
+}
+
+const REMOTE_RUNNING: &str = "__UNIRUN_RUNNING__";
+const REMOTE_NO_RC: &str = "__UNIRUN_NO_RC__";
+
+/// Parse the probe's stdout. Unknown text (e.g. an ssh error) is `Unreachable`
+/// — never "still running", which would keep a dead session alive forever.
+fn classify_remote_probe(stdout: &str) -> RemoteProbe {
+    let text = stdout.trim();
+    if text.ends_with(REMOTE_RUNNING) {
+        return RemoteProbe::Running;
+    }
+    if text.ends_with(REMOTE_NO_RC) {
+        return RemoteProbe::Vanished;
+    }
+    text.lines()
+        .rev()
+        .find_map(|l| l.trim().parse::<i32>().ok())
+        .map(RemoteProbe::Exited)
+        .unwrap_or(RemoteProbe::Unreachable)
+}
+
+fn posix_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Snapshot of the executed spec (for inspection; not an execution resume).
@@ -117,6 +217,7 @@ pub fn start(spec: &ExecSpec, label: &str) -> Result<SessionState, String> {
             duration_ms: 0,
             encoding: String::new(),
             shell_used: String::new(),
+            remote: None,
         },
     )?;
 
@@ -172,6 +273,7 @@ pub fn start(spec: &ExecSpec, label: &str) -> Result<SessionState, String> {
         duration_ms: 0,
         encoding: String::new(),
         shell_used: String::new(),
+        remote: None,
     });
     st.pid = Some(child.id());
     write_json(&dir.join("state.json"), &st).map_err(|e| format!("cannot write state: {}", e))?;
@@ -270,6 +372,7 @@ pub fn run_runner(session_dir: &Path) -> i32 {
         duration_ms: result.duration_ms,
         encoding: result.encoding.clone(),
         shell_used: result.shell_used.clone(),
+        remote: None,
     };
     if let Some(prev) = std::fs::read_to_string(session_dir.join("state.json"))
         .ok()
@@ -317,6 +420,94 @@ extern "C" fn on_sigterm(_: libc::c_int) {
 const RUNNER_SETTLE_GRACE: Duration = Duration::from_millis(1_000);
 const RUNNER_SETTLE_POLL: Duration = Duration::from_millis(20);
 
+/// Record a **detached remote run** as a session, so `bg status` / `bg output`
+/// / `bg kill` can drive it later. No local runner exists: the remote side owns
+/// the process.
+pub fn attach_remote(
+    run: &crate::transport::DetachedRun,
+    label: &str,
+    spec: &SessionSpec,
+    ssh: &crate::transport::SshTarget,
+) -> Result<SessionState, String> {
+    let id = new_id();
+    let dir = session_dir(&id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create session dir: {}", e))?;
+    write_json(&dir.join("spec.json"), spec)?;
+    let st = SessionState {
+        id: id.clone(),
+        label: label.to_string(),
+        status: "running".into(),
+        pid: Some(run.pid),
+        started_at: now_millis(),
+        finished_at: None,
+        exit_code: None,
+        error_class: None,
+        hint: None,
+        truncated: false,
+        truncated_log: false,
+        duration_ms: 0,
+        encoding: "utf-8".into(),
+        shell_used: ssh.shell.as_str().to_string(),
+        remote: Some(RemoteSession {
+            host: run.host.clone(),
+            shell: ssh.shell.as_str().to_string(),
+            pid: run.pid,
+            log: run.log.clone(),
+            rc_file: run.rc_file.clone(),
+            script_file: run.script_file.clone(),
+            user: ssh.user.clone(),
+            port: ssh.port,
+            identity_file: ssh
+                .identity_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            connect_timeout: ssh.connect_timeout,
+            timeout_ms: ssh.timeout_ms,
+            max_output_bytes: ssh.max_output_bytes,
+            output_encoding: ssh.output_encoding.clone(),
+        }),
+    };
+    write_json(&dir.join("state.json"), &st)?;
+    Ok(st)
+}
+
+/// Refresh a detached remote session's state from one probe.
+fn refresh_remote(id: &str, st: &mut SessionState, settle: bool) -> Result<(), String> {
+    let Some(remote) = st.remote.clone() else {
+        return Ok(());
+    };
+    if st.is_terminal() {
+        return Ok(());
+    }
+    match remote.probe() {
+        RemoteProbe::Running => Ok(()),
+        RemoteProbe::Exited(rc) => {
+            st.status = if rc == 0 { "completed" } else { "failed" }.into();
+            st.exit_code = Some(rc);
+            st.finished_at = Some(now_millis());
+            st.duration_ms = st.finished_at.unwrap_or(0).saturating_sub(st.started_at);
+            write_json(&session_dir(id).join("state.json"), st)
+        }
+        RemoteProbe::Vanished => {
+            // Killed, rebooted, or the host went away: the run is over but its
+            // status was never observed. Say that instead of inventing one.
+            st.status = "interrupted".into();
+            st.hint = Some("the remote process disappeared without writing an exit status".into());
+            st.finished_at = Some(now_millis());
+            st.duration_ms = st.finished_at.unwrap_or(0).saturating_sub(st.started_at);
+            write_json(&session_dir(id).join("state.json"), st)
+        }
+        RemoteProbe::Unreachable => {
+            if settle {
+                // A transport hiccup must not mark a live run dead: leave it
+                // running and let the caller retry.
+                st.hint = Some("remote probe failed; session state is unchanged".into());
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Read the current state of a session (with stale-detection).
 pub fn status(id: &str) -> Result<SessionState, String> {
     status_with_settle(id, true)
@@ -327,6 +518,10 @@ pub fn status(id: &str) -> Result<SessionState, String> {
 /// keeping `bg list` fast no matter how many interrupted sessions exist.
 fn status_with_settle(id: &str, settle: bool) -> Result<SessionState, String> {
     let mut st = load_state(id)?;
+    if st.remote.is_some() {
+        refresh_remote(id, &mut st, settle)?;
+        return Ok(st);
+    }
     if st.status == "running" {
         if let Some(pid) = st.pid {
             if !pid_alive(pid) {
@@ -357,6 +552,17 @@ fn status_with_settle(id: &str, settle: bool) -> Result<SessionState, String> {
 /// stdout/stderr log tails for a session. Returns `(stdout, stderr, truncated_log)`.
 pub fn output(id: &str, tail_bytes: usize) -> Result<(String, String, bool), String> {
     let st = status(id)?;
+    if let Some(remote) = &st.remote {
+        // Detached remote run: stdout and stderr are merged into the remote log
+        // (the wrapper redirects both), so the stderr half is empty by design.
+        let script = format!(
+            "tail -c {} {} 2>/dev/null",
+            tail_bytes,
+            posix_quote(&remote.log)
+        );
+        let r = crate::transport::ssh_run(&remote.target(), &script);
+        return Ok((r.stdout, String::new(), st.truncated_log));
+    }
     let dir = session_dir(id);
     let so = read_tail(&dir.join("stdout.log"), tail_bytes);
     let se = read_tail(&dir.join("stderr.log"), tail_bytes);
@@ -382,6 +588,44 @@ pub struct OutputPage {
     pub reset: bool,
 }
 
+/// Stop a detached remote run.
+///
+/// The local identity layer cannot help here: the pid belongs to another host,
+/// so the check is remote and structural instead — the process-group leader pid
+/// came from the wrapper's own `echo $$`, and the group is signalled so the
+/// descendants of a pipeline go with it. A pid that does not exist is reported
+/// as already finished rather than as a failed kill.
+fn kill_remote(
+    id: &str,
+    mut st: SessionState,
+    remote: &RemoteSession,
+) -> Result<SessionState, String> {
+    let pid = remote.pid;
+    let script = format!(
+        "kill -TERM -{pid} 2>/dev/null || kill -TERM {pid} 2>/dev/null; sleep 0.3; if kill -0 {pid} 2>/dev/null; then kill -KILL -{pid} 2>/dev/null || kill -KILL {pid} 2>/dev/null; fi; if kill -0 {pid} 2>/dev/null; then echo {still}; else echo {gone}; fi",
+        pid = pid,
+        still = REMOTE_RUNNING,
+        gone = REMOTE_NO_RC,
+    );
+    let r = crate::transport::ssh_run(&remote.target(), &script);
+    let probe = classify_remote_probe(&r.stdout);
+    let finished_at = now_millis();
+    st.finished_at = Some(finished_at);
+    st.duration_ms = finished_at.saturating_sub(st.started_at);
+    match probe {
+        RemoteProbe::Running => {
+            st.status = "running".into();
+            st.hint = Some("the remote process survived SIGTERM and SIGKILL".into());
+        }
+        _ => {
+            st.status = "killed".into();
+            st.exit_code = None;
+        }
+    }
+    write_json(&session_dir(id).join("state.json"), &st)?;
+    Ok(st)
+}
+
 /// Current end offset of a session's logs, for callers that want to switch from
 /// `--tail` to cursor mode without missing or repeating anything.
 pub fn log_len(id: &str) -> u64 {
@@ -400,6 +644,29 @@ pub fn log_len(id: &str) -> u64 {
 /// <next_cursor>`, … instead of re-reading (and re-parsing) the same tail.
 pub fn output_since(id: &str, cursor: u64) -> Result<OutputPage, String> {
     let st = status(id)?;
+    if let Some(remote) = &st.remote {
+        // `tail -c +N` is 1-based, so cursor+1 continues exactly where the last
+        // page stopped. The remote log is never capped, so no reset is possible
+        // beyond a cursor that is simply ahead of it.
+        let script = format!(
+            "wc -c < {log} 2>/dev/null; tail -c +{from} {log} 2>/dev/null",
+            log = posix_quote(&remote.log),
+            from = cursor.saturating_add(1)
+        );
+        let r = crate::transport::ssh_run(&remote.target(), &script);
+        let mut lines = r.stdout.splitn(2, '\n');
+        let len: u64 = lines.next().unwrap_or("").trim().parse().unwrap_or(0);
+        let body = lines.next().unwrap_or("").to_string();
+        let reset = cursor > len;
+        return Ok(OutputPage {
+            id: id.to_string(),
+            stdout: if reset { String::new() } else { body },
+            stderr: String::new(),
+            next_cursor: len.max(cursor),
+            truncated_log: false,
+            reset,
+        });
+    }
     let dir = session_dir(id);
     let (stdout, so_next, so_reset) = read_since(&dir.join("stdout.log"), cursor);
     let (stderr, se_next, se_reset) = read_since(&dir.join("stderr.log"), cursor);
@@ -454,6 +721,9 @@ pub fn kill(id: &str) -> Result<SessionState, String> {
     let mut st = status(id)?;
     if st.is_terminal() {
         return Ok(st);
+    }
+    if let Some(remote) = st.remote.clone() {
+        return kill_remote(id, st, &remote);
     }
     let pid = st.pid.ok_or("session has no runner pid")?;
 
@@ -732,6 +1002,7 @@ mod tests {
             duration_ms: 0,
             encoding: String::new(),
             shell_used: String::new(),
+            remote: None,
         };
         write_json(&dir.join("state.json"), &state).unwrap();
         write_json(
@@ -783,6 +1054,7 @@ mod tests {
             duration_ms: 0,
             encoding: String::new(),
             shell_used: String::new(),
+            remote: None,
         };
         write_json(&dir.join("state.json"), &state).unwrap();
         // No start epoch and no observable token: nothing ties the pid to this
@@ -831,6 +1103,7 @@ mod tests {
             duration_ms: 0,
             encoding: String::new(),
             shell_used: String::new(),
+            remote: None,
         };
         write_json(&dir.join("state.json"), &state).unwrap();
         let st = kill(&id).unwrap();
@@ -873,6 +1146,7 @@ mod tests {
             duration_ms: 0,
             encoding: String::new(),
             shell_used: String::new(),
+            remote: None,
         };
         write_json(&dir.join("state.json"), &running).unwrap();
 
@@ -903,6 +1177,97 @@ mod tests {
             "completed",
             "on-disk record must keep the runner's verdict"
         );
+
+        std::env::remove_var("UNIRUN_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The probe's three answers, plus the one that matters most: unparseable
+    /// output (an ssh error) must never read as "still running", or a dead
+    /// session would be reported alive forever.
+    #[test]
+    fn remote_probe_classification() {
+        assert_eq!(
+            classify_remote_probe("__UNIRUN_RUNNING__\n"),
+            RemoteProbe::Running
+        );
+        assert_eq!(classify_remote_probe("0\n"), RemoteProbe::Exited(0));
+        assert_eq!(classify_remote_probe("42\n"), RemoteProbe::Exited(42));
+        assert_eq!(
+            classify_remote_probe("__UNIRUN_NO_RC__\n"),
+            RemoteProbe::Vanished
+        );
+        assert_eq!(
+            classify_remote_probe("ssh: connect to host x port 22: Connection refused\n"),
+            RemoteProbe::Unreachable
+        );
+        assert_eq!(classify_remote_probe(""), RemoteProbe::Unreachable);
+        // The rc file wins when both appear (the process could have exited
+        // between the two checks).
+        assert_eq!(
+            classify_remote_probe("7\n__UNIRUN_RUNNING__"),
+            RemoteProbe::Running,
+            "last line is the state check"
+        );
+    }
+
+    /// A detached record must carry everything the later `bg status/output/kill`
+    /// needs to reconnect with the same identity, and `target()` must give it
+    /// back unchanged.
+    #[test]
+    fn remote_record_round_trips_through_the_state_file() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = temp_home("remote-record");
+        std::env::set_var("UNIRUN_HOME", &home);
+
+        let ssh = crate::transport::SshTarget {
+            host: "nas.example".into(),
+            shell: crate::spec::Shell::Bash,
+            timeout_ms: 5_000,
+            connect_timeout: 7,
+            user: Some("admin".into()),
+            port: Some(2222),
+            identity_file: Some(std::path::PathBuf::from("/tmp/id_ed25519")),
+            workdir: None,
+            env: Vec::new(),
+            max_output_bytes: 4_096,
+            output_encoding: Some("gbk".into()),
+            drain_ms: 0,
+        };
+        let run = crate::transport::DetachedRun {
+            host: "nas.example".into(),
+            pid: 4242,
+            log: "/tmp/unirun-x.log".into(),
+            rc_file: "/tmp/unirun-x.rc".into(),
+            script_file: "/tmp/unirun-x.sh".into(),
+        };
+        let spec = SessionSpec {
+            command: "long-job".into(),
+            shell: Some("bash".into()),
+            workdir: None,
+            timeout_ms: 5_000,
+        };
+        let st = attach_remote(&run, "nightly", &spec, &ssh).unwrap();
+        assert_eq!(st.status, "running");
+        assert_eq!(st.pid, Some(4242));
+
+        let loaded = load_state(&st.id).unwrap();
+        let remote = loaded.remote.expect("remote handles must persist");
+        assert_eq!(remote.pid, 4242);
+        assert_eq!(remote.host, "nas.example");
+        assert_eq!(remote.rc_file, "/tmp/unirun-x.rc");
+        let rebuilt = remote.target();
+        assert_eq!(rebuilt.user.as_deref(), Some("admin"));
+        assert_eq!(rebuilt.port, Some(2222));
+        assert_eq!(rebuilt.connect_timeout, 7);
+        assert_eq!(rebuilt.max_output_bytes, 4_096);
+        assert_eq!(rebuilt.output_encoding.as_deref(), Some("gbk"));
+        assert_eq!(rebuilt.shell, crate::spec::Shell::Bash);
+        // The spec travels with the session for inspection.
+        let spec_text = std::fs::read_to_string(session_dir(&st.id).join("spec.json")).unwrap();
+        assert!(spec_text.contains("long-job"));
 
         std::env::remove_var("UNIRUN_HOME");
         let _ = std::fs::remove_dir_all(&home);

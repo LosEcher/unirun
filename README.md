@@ -163,6 +163,7 @@ version→feature table:
  "features":["local-exec","probe","mcp","acp","bg-session","recipe-registry",
              "recipe-toolchain","ssh","ssh-identity","ssh-workdir-env",
              "remote-abort","mcp-cancel","probe-state","session-cursor",
+             "ssh-detach",
              "error-taxonomy","output-cap","truncation-flag","transport-error",
              "dispatched","kill-status","exit-code-confidence","drain-timeout",
              "legacy-codepage","encoding-hint","strict-flags"]}
@@ -254,6 +255,36 @@ environment variable names are ignored.
 unirun ssh linux-host 'echo 中文OK; exit 42' --shell bash --workdir /srv/app --env APP_ENV=prod --json
 unirun ssh win-srv 'Write-Output hi' --shell powershell --user admin --port 22 --identity ~/.ssh/id_ed25519 --env APP_ENV=prod
 ```
+
+#### Detached remote runs (POSIX targets)
+
+An ssh-attached long task is reaped when the session ends — a real incident on
+this fleet (`NETWORK-FLEET-AND-TRANSFER-DESIGN-ANALYSIS-2026-09-18.md:445`:
+four large shares silently disappeared when the ssh session closed). `--detach`
+starts the script in its own session instead, and records a session so it stays
+pollable from here:
+
+```bash
+$ unirun ssh nas 'synoindex -R /volume1' --shell bash --detach --json
+{"id":"862718cd5514c7ea4d380","status":"running","pid":4242,"remote":{...}}
+
+$ unirun bg status 862718cd5514c7ea4d380        # probes the remote pid + rc file
+$ unirun bg output 862718cd5514c7ea4d380 --since 0
+$ unirun bg kill   862718cd5514c7ea4d380        # TERM the group, then KILL
+```
+
+Details worth knowing:
+
+- the wrapper prefers `setsid` and falls back to `nohup` (minimal NAS shells);
+  stdout and stderr are merged into one remote log, and the script's exit status
+  is written to a remote rc file, so `bg status` reports the real code;
+- `bg status` maps "process gone with no rc" to `interrupted` rather than
+  inventing a status, and a failed probe leaves the session running instead of
+  declaring it dead;
+- Windows targets are **refused** (`error_class: UNSUPPORTED`, with a hint
+  naming `schtasks`): persistence there is a scheduled task, a different
+  mechanism with different handles, and pretending would produce runs that look
+  started and die with the session.
 
 Identity options: `--user U` (user@host), `--port N`, `--identity FILE`
 (-i). Connections are made with `BatchMode=yes`,

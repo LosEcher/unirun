@@ -27,7 +27,9 @@ USAGE:
                                         capability keys; for consumers)
   unirun mcp                            serve the MCP protocol over stdio
   unirun acp                            serve the Agent Client Protocol over stdio
-  unirun ssh <host> '<script>' [opts]  run a script on a remote host (Unix or Windows)
+  unirun ssh <host> '<script>' [--detach] [opts]
+                                        run a script remotely; --detach starts it
+                                        detached and records a session
   unirun bg <start|status|output|kill|list|wait> ...   background sessions
   unirun recipe <list|show|add|rm|path|effective|check>   recipe registry
   unirun winrm <host> '<script>' [opts]  run a script via WinRM (feature: winrm)
@@ -139,6 +141,8 @@ struct CliOpts {
     tail_bytes: Option<usize>,
     /// `--since N`: return only what was appended after byte offset N.
     since: Option<u64>,
+    /// `ssh --detach`: start the remote run detached and record a session.
+    detach: bool,
     /// Per-stream output cap in bytes (`--max-output`); applies to local,
     /// SSH and WinRM runs alike. `None`/`0` → the shared default (256 KiB).
     max_output_bytes: Option<usize>,
@@ -236,6 +240,7 @@ fn parse_flags(raw_args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, S
                 opts.toolchain = Some(v.clone());
             }
             "--no-coalesce" => opts.no_coalesce = true,
+            "--detach" => opts.detach = true,
             "--user" => {
                 i += 1;
                 let v = args.get(i).ok_or("--user needs a value")?;
@@ -513,8 +518,53 @@ fn cmd_ssh(args: &[String]) -> ExitCode {
         target.timeout_ms = t * 1000;
     }
     let script = positional[1..].join(" ");
+    if opts.detach {
+        return cmd_ssh_detach(&script, &target, &opts);
+    }
     let result = unirun::ssh_run(&target, &script);
     emit(&result, &opts, opts.pretty)
+}
+
+/// `unirun ssh <host> '<script>' --detach`: start the script detached on the
+/// remote, record a session for it, and print the session (like `bg start`).
+fn cmd_ssh_detach(script: &str, target: &unirun::SshTarget, opts: &CliOpts) -> ExitCode {
+    use unirun::session as sess;
+    let spec = sess::SessionSpec {
+        command: script.to_string(),
+        shell: Some(target.shell.as_str().to_string()),
+        workdir: target
+            .workdir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        timeout_ms: target.timeout_ms,
+    };
+    match unirun::transport::ssh_run_detached(target, script) {
+        Ok(run) => {
+            match sess::attach_remote(&run, opts.label.as_deref().unwrap_or(""), &spec, target) {
+                Ok(st) => {
+                    if opts.json || opts.pretty {
+                        let out = if opts.pretty {
+                            serde_json::to_string_pretty(&st).unwrap_or_default()
+                        } else {
+                            serde_json::to_string(&st).unwrap_or_default()
+                        };
+                        println!("{}", out);
+                    } else {
+                        println!(
+                            "session {} on {} (remote pid {}) — log {}",
+                            st.id, run.host, run.pid, run.log
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("unirun ssh --detach: {}", e);
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Err(r) => emit(&r, opts, opts.pretty),
+    }
 }
 
 fn cmd_capabilities(args: &[String]) -> ExitCode {

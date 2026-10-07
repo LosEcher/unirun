@@ -28,6 +28,10 @@
 //!                                    same path)
 //!   PROCESS_UNKILLABLE               (the tree survived an escalated kill —
 //!                                    `kill_status: "survived"`, structural)
+//!   UNSUPPORTED                      (this combination is deliberately not
+//!                                    implemented — e.g. `--detach` against a
+//!                                    Windows target. Structural: unirun says so
+//!                                    itself instead of failing obscurely)
 //!
 //! Matching order (first hit wins):
 //!   1. structural cases handled here (timeout / abort / POSIX exit codes)
@@ -54,6 +58,11 @@ pub fn classify_with_maps(
     r: &ExecResult,
     recipe_maps: Option<&BTreeMap<String, ErrorMapEntry>>,
 ) -> (Option<String>, Option<String>) {
+    if let Some(class) = r.error_class.as_deref() {
+        if class == "UNSUPPORTED" {
+            return (r.error_class.clone(), r.hint.clone());
+        }
+    }
     // The tree survived even an escalated kill (D state, stuck driver): the
     // run is over but its processes are not, which outranks the timeout that
     // triggered the kill.

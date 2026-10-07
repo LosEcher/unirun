@@ -465,6 +465,116 @@ fn assemble_ssh_result(
     result
 }
 
+/// The line the detach wrapper prints once the remote process is running.
+pub const DETACHED_SENTINEL: &str = "__UNIRUN_DETACHED__";
+/// Printed instead when the wrapper could not establish the remote pid.
+pub const DETACHED_ERROR_SENTINEL: &str = "__UNIRUN_DETACHED_ERROR__";
+
+/// A remote process unirun started detached, plus the handles to poll it.
+///
+/// The remote side owns everything durable here (pid, log, exit code file); the
+/// local session record just remembers where to look, which is what makes a
+/// detached run survive both the ssh session and this machine.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DetachedRun {
+    pub host: String,
+    /// Remote process-group leader (the script's own pid).
+    pub pid: u32,
+    /// Remote log file (`stdout` and `stderr` are merged into it).
+    pub log: String,
+    /// Remote file the script's exit status is written to when it finishes.
+    pub rc_file: String,
+    /// Remote path of the uploaded script (kept for debugging/re-running).
+    pub script_file: String,
+}
+
+/// The POSIX detach wrapper.
+///
+/// `setsid` is preferred (a teardown cannot reach a different session) with a
+/// `nohup`-only fallback for minimal hosts such as a NAS busybox. The inner
+/// shell is single-quoted and reads its paths from the **environment**, so no
+/// path is ever interpolated into quoted shell text.
+fn detached_wrapper(script_file: &str, log: &str, rc_file: &str, pid_file: &str) -> String {
+    format!(
+        "UNIRUN_SCRIPT={}\nUNIRUN_LOG={}\nUNIRUN_RC={}\nUNIRUN_PIDFILE={}\nexport UNIRUN_SCRIPT UNIRUN_LOG UNIRUN_RC UNIRUN_PIDFILE\nrm -f \"$UNIRUN_PIDFILE\" \"$UNIRUN_RC\"\nif command -v setsid >/dev/null 2>&1; then\n  setsid sh -c 'echo $$ > \"$UNIRUN_PIDFILE\"; sh \"$UNIRUN_SCRIPT\"; echo $? > \"$UNIRUN_RC\"' >\"$UNIRUN_LOG\" 2>&1 </dev/null &\nelse\n  nohup sh -c 'echo $$ > \"$UNIRUN_PIDFILE\"; sh \"$UNIRUN_SCRIPT\"; echo $? > \"$UNIRUN_RC\"' >\"$UNIRUN_LOG\" 2>&1 </dev/null &\nfi\ni=0\nwhile [ ! -s \"$UNIRUN_PIDFILE\" ] && [ $i -lt 50 ]; do i=$((i+1)); sleep 0.1; done\npid=$(cat \"$UNIRUN_PIDFILE\" 2>/dev/null)\nif [ -z \"$pid\" ]; then echo \"{} pidfile not written\"; exit 1; fi\necho \"{} $pid $UNIRUN_LOG $UNIRUN_RC\"\n",
+        posix_quote(script_file),
+        posix_quote(log),
+        posix_quote(rc_file),
+        posix_quote(pid_file),
+        DETACHED_ERROR_SENTINEL,
+        DETACHED_SENTINEL,
+    )
+}
+
+/// Parse the wrapper's sentinel line.
+fn parse_detached(stdout: &str, host: &str, script_file: &str) -> Option<DetachedRun> {
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(DETACHED_SENTINEL) {
+            let mut parts = rest.split_whitespace();
+            let pid = parts.next()?.parse::<u32>().ok()?;
+            let log = parts.next()?.to_string();
+            let rc_file = parts.next()?.to_string();
+            return Some(DetachedRun {
+                host: host.to_string(),
+                pid,
+                log,
+                rc_file,
+                script_file: script_file.to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// Start `script` detached on a POSIX remote, returning the handles that make it
+/// pollable later. The remote process outlives this ssh session — which is the
+/// whole point: an ssh-attached long task is silently reaped when the session
+/// ends (`NETWORK-FLEET-AND-TRANSFER-DESIGN-ANALYSIS-2026-09-18.md:445`).
+///
+/// Windows targets are refused rather than half-supported: persistence there is
+/// a scheduled task (`schtasks /run`), a different mechanism with different
+/// handles, and pretending otherwise would produce runs that look started and
+/// die with the session.
+#[allow(clippy::result_large_err)] // the failure *is* a normalized ExecResult
+pub fn ssh_run_detached(target: &SshTarget, script: &str) -> Result<DetachedRun, ExecResult> {
+    if !matches!(target.shell, Shell::Bash | Shell::Sh | Shell::Zsh) {
+        let mut r = ExecResult::success(String::new(), String::new(), target.shell.as_str());
+        r.exit_code = None;
+        r.dispatched = false;
+        r.error_class = Some("UNSUPPORTED".into());
+        r.hint = Some(
+            "detached runs are implemented for POSIX remotes; on Windows use the scheduled-task mechanism (schtasks /run) directly"
+                .into(),
+        );
+        return Err(r);
+    }
+    let nonce = nonce();
+    let script_file = format!("/tmp/unirun-{}.sh", nonce);
+    let log = format!("/tmp/unirun-{}.log", nonce);
+    let rc_file = format!("/tmp/unirun-{}.rc", nonce);
+    let pid_file = format!("/tmp/unirun-{}.pid", nonce);
+    if let Err(e) = upload_scp(target, &script_file, script.as_bytes()) {
+        return Err(upload_failed(target.shell.as_str(), e));
+    }
+    let wrapper = detached_wrapper(&script_file, &log, &rc_file, &pid_file);
+    let result = ssh_run(target, &wrapper);
+    if let Some(run) = parse_detached(&result.stdout, &target.host, &script_file) {
+        return Ok(run);
+    }
+    // No sentinel: report the transport failure (or the wrapper's own error)
+    // instead of inventing a session that cannot be polled.
+    let mut r = result;
+    if r.error_class.is_none() {
+        r.error_class = Some("UNSUPPORTED".into());
+    }
+    r.hint = Some(format!(
+        "could not establish the detached remote process: {}",
+        r.stderr.trim()
+    ));
+    Err(r)
+}
+
 /// Build the `ssh` argv for a target + remote command. Pure and
 /// unit-testable: host/user/port/identity + the strict batch options.
 ///
@@ -1114,6 +1224,86 @@ mod tests {
         );
         assert!(!not_truncated);
         assert_eq!(all, data);
+    }
+
+    /// The wrapper must start the script in a way that outlives the ssh session
+    /// (setsid preferred, nohup fallback), redirect both streams into the log,
+    /// detach stdin, and hand back a pid the caller can poll.
+    #[test]
+    fn detach_wrapper_detaches_and_reports_a_pid() {
+        let w = detached_wrapper("/tmp/s.sh", "/tmp/s.log", "/tmp/s.rc", "/tmp/s.pid");
+        assert!(w.contains("UNIRUN_SCRIPT='/tmp/s.sh'"));
+        assert!(w.contains("UNIRUN_LOG='/tmp/s.log'"));
+        assert!(w.contains("UNIRUN_RC='/tmp/s.rc'"));
+        assert!(w.contains("UNIRUN_PIDFILE='/tmp/s.pid'"));
+        assert!(w.contains("command -v setsid"), "setsid preferred: {w}");
+        assert!(w.contains("nohup sh -c"), "nohup fallback: {w}");
+        assert!(w.contains("</dev/null"), "stdin must be detached: {w}");
+        assert_eq!(
+            w.matches(r#">"$UNIRUN_LOG" 2>&1 </dev/null"#).count(),
+            2,
+            "both launchers merge stderr and detach stdin: {w}"
+        );
+        assert!(
+            w.contains(r#"echo $$ > "$UNIRUN_PIDFILE""#),
+            "the remote script's own pid must be recorded: {w}"
+        );
+        assert!(
+            w.contains(r#"echo $? > "$UNIRUN_RC""#),
+            "the remote exit status must be recorded: {w}"
+        );
+        assert!(w.contains(DETACHED_SENTINEL));
+    }
+
+    /// Paths are quoted, so a target directory with a space or quote cannot
+    /// break out of the wrapper.
+    #[test]
+    fn detach_wrapper_quotes_paths() {
+        let w = detached_wrapper("/tmp/a b/it's.sh", "/tmp/l", "/tmp/r", "/tmp/p");
+        assert!(w.contains(r"UNIRUN_SCRIPT='/tmp/a b/it'\''s.sh'"), "{w}");
+        assert!(!w.contains("UNIRUN_SCRIPT=/tmp/a b/it's.sh"));
+    }
+
+    #[test]
+    fn detached_sentinel_is_parsed_and_junk_is_ignored() {
+        let stdout = "some ssh noise\n__UNIRUN_DETACHED__ 4242 /tmp/x.log /tmp/x.rc\n";
+        let run = parse_detached(stdout, "h.example", "/tmp/x.sh").expect("parsed");
+        assert_eq!(
+            run,
+            DetachedRun {
+                host: "h.example".into(),
+                pid: 4242,
+                log: "/tmp/x.log".into(),
+                rc_file: "/tmp/x.rc".into(),
+                script_file: "/tmp/x.sh".into(),
+            }
+        );
+        assert!(parse_detached("no sentinel here", "h", "/tmp/x.sh").is_none());
+        assert!(
+            parse_detached("__UNIRUN_DETACHED__ not-a-pid /l /r", "h", "/s").is_none(),
+            "a malformed pid must not become a session"
+        );
+        assert!(
+            parse_detached("__UNIRUN_DETACHED__ 1 /l", "h", "/s").is_none(),
+            "a truncated sentinel must not become a session"
+        );
+    }
+
+    /// Windows persistence is a different mechanism; refusing loudly beats a
+    /// run that looks started and dies with the session.
+    #[test]
+    fn detach_refuses_non_posix_targets() {
+        for shell in [Shell::Powershell, Shell::Pwsh, Shell::Cmd] {
+            let t = SshTarget { shell, ..target() };
+            let err = ssh_run_detached(&t, "echo hi").expect_err("must refuse");
+            assert_eq!(err.error_class.as_deref(), Some("UNSUPPORTED"));
+            assert!(!err.dispatched, "nothing was started");
+            assert!(
+                err.hint.as_deref().unwrap_or("").contains("schtasks"),
+                "the hint must point at the supported mechanism: {:?}",
+                err.hint
+            );
+        }
     }
 
     /// Platform differences, 16 and 17: the payload never appears literally in
