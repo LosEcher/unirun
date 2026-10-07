@@ -40,6 +40,19 @@ jobs:
         run: cargo check --features winrm --all-targets
       - name: Build
         run: cargo build --release
+      - name: Packaging content gate
+        # `Cargo.toml` excludes the fleet-internal docs/scripts/agent notes. This
+        # gate is what keeps that line from being quietly deleted: the payload is
+        # the product, and a cross-repo audit note is not part of it.
+        run: |
+          set -euo pipefail
+          cargo package --list --allow-dirty > /tmp/pkg-list.txt
+          if grep -Eq '^(docs/|scripts/apply-build-profile\.sh|scripts/clean-build-artifacts\.sh|AGENTS\.md|\.github/)' /tmp/pkg-list.txt; then
+            echo "::error::internal files must not ship in the .crate:"
+            grep -E '^(docs/|scripts/apply-build-profile\.sh|scripts/clean-build-artifacts\.sh|AGENTS\.md|\.github/)' /tmp/pkg-list.txt
+            exit 1
+          fi
+          echo "packaged $(wc -l < /tmp/pkg-list.txt) files"
       - name: Test
         run: cargo test
       - name: Test (winrm feature)
