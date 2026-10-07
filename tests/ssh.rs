@@ -64,6 +64,11 @@ fn ssh_transport_failure_is_classified() {
         "the client's diagnostic must not stay in the remote stderr: {:?}",
         r.stderr
     );
+    assert!(
+        !r.dispatched,
+        "a refused connection proves the remote command never ran: {:?}",
+        r
+    );
 }
 
 /// Unix remote target; host from `UNIRUN_TEST_SSH_HOST`, user/port/identity

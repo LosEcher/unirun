@@ -42,7 +42,7 @@
 | A15 代码页解码 | ✅ 已完成 | GBK 自动回退 + `--output-encoding`/recipe `[conventions] encoding`（此前该字段解析了但从未生效）+ CP437/CP850/CP1252/Big5 显式提示；15 单测 + 4 CLI 集成测试；dist 二进制 +165 KB（已记录在 Cargo.toml） |
 | A1 未知 flag fail-closed | ✅ 已完成 | 未知 `--flag` → exit 2（不再拼进命令/远端脚本）；`--flag=value` 与 `--` 逃生口；`tests/cli_args.rs` 8 例 |
 | A16 `transport_error` | ✅ 已完成 | 新增 `transport_error`/`transport_stderr` 字段 + taxonomy 类 `TRANSPORT`；255 需有 ssh 自身诊断证据；真实「连接被拒」集成测试 |
-| A13 `dispatched` | ⏳ 待办 | |
+| A13 `dispatched` | ✅ 已完成 | 新增 `dispatched`（只有前派发证据才为 false：spawn 失败/连接/认证/上传）；远端 255 与中途断连保守为 true；README 增「never ran vs ran and failed」节 |
 | A10 `capabilities --json` | ⏳ 待办 | |
 | A11 README 重试/unknown 语义 | ⏳ 待办 | |
 | A2–A5（取消与 kill 语义） | ⏳ 待办 | |

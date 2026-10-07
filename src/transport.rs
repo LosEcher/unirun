@@ -380,6 +380,11 @@ fn assemble_ssh_result(
         } else {
             (stderr, None, false)
         };
+    // The ssh child spawned, so execution *may* have started; only a clean
+    // pre-dispatch signature (connect/auth/upload) clears the flag.
+    let dispatched = !transport_stderr
+        .as_deref()
+        .is_some_and(provably_not_dispatched);
 
     let mut result = ExecResult {
         exit_code,
@@ -396,6 +401,7 @@ fn assemble_ssh_result(
         shell_used: target.shell.as_str().to_string(),
         transport_error,
         transport_stderr,
+        dispatched,
     };
     let (class, hint) = classify(&result);
     result.error_class = class;
@@ -516,6 +522,7 @@ fn upload_failed(shell_used: &str, e: std::io::Error) -> ExecResult {
     r.transport_stderr = Some(format!("upload failed: {}", e));
     r.error_class = Some("TRANSPORT".into());
     r.hint = Some("scp to the remote host failed; check host/credentials".into());
+    r.dispatched = false;
     r
 }
 
@@ -607,6 +614,42 @@ const TRANSPORT_DIAGNOSTIC_PREFIXES: &[&str] = &[
     "remote host identification has changed",
     "banner exchange: ",
 ];
+
+/// Transport diagnostics that prove the remote command was never dispatched:
+/// the connection, the authentication or the payload upload failed.
+///
+/// Anything else the client reports (`Connection closed by …`, `Received
+/// disconnect from …`, `channel 0: open failed:`) can happen *after* the remote
+/// started executing, so it must not clear `dispatched`.
+const PRE_DISPATCH_PREFIXES: &[&str] = &[
+    "ssh: connect to host",
+    "ssh: could not resolve hostname",
+    "ssh: unknown port",
+    "permission denied (",
+    "host key verification failed",
+    "no matching host key type found",
+    "too many authentication failures",
+    "remote host identification has changed",
+    "kex_exchange_identification:",
+    "ssh_exchange_identification:",
+    "banner exchange: ",
+    "scp: ",
+    "upload failed:",
+];
+
+/// Did the remote command never start, according to the transport's own
+/// diagnostics? Conservative: every line must be a recognised pre-dispatch
+/// signature, so a mixed or unrecognised report still means "it may have run".
+fn provably_not_dispatched(transport_stderr: &str) -> bool {
+    let mut lines = transport_stderr.lines().peekable();
+    if lines.peek().is_none() {
+        return false;
+    }
+    lines.all(|line| {
+        let lower = line.trim_start().to_lowercase();
+        PRE_DISPATCH_PREFIXES.iter().any(|p| lower.starts_with(p))
+    })
+}
 
 /// Split the ssh client's own diagnostics out of the captured stderr.
 ///
@@ -843,6 +886,79 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("scp exited non-zero"));
+    }
+
+    /// `dispatched` is the retry-safety signal: only a clean pre-dispatch
+    /// signature (connect/auth/upload) may clear it.
+    #[test]
+    fn dispatched_is_cleared_only_by_evidence_of_no_dispatch() {
+        let t = target();
+        let refused = assemble_ssh_result(
+            &t,
+            Some(255),
+            false,
+            capture(b"", false),
+            capture(
+                b"ssh: connect to host h port 22: Connection refused\n",
+                false,
+            ),
+            4,
+        );
+        assert!(refused.transport_error);
+        assert!(
+            !refused.dispatched,
+            "a refused connection never reached the remote"
+        );
+
+        let auth = assemble_ssh_result(
+            &t,
+            Some(255),
+            false,
+            capture(b"", false),
+            capture(b"Permission denied (publickey).\n", false),
+            4,
+        );
+        assert!(!auth.dispatched);
+
+        // Closed mid-run: the command may have executed (and left side effects).
+        let dropped = assemble_ssh_result(
+            &t,
+            Some(255),
+            false,
+            capture(b"", false),
+            capture(b"Connection closed by 10.0.0.1 port 22\n", false),
+            4,
+        );
+        assert!(dropped.transport_error);
+        assert!(
+            dropped.dispatched,
+            "a mid-run disconnect must not license a blind retry"
+        );
+
+        // Mixed evidence: conservative.
+        let mixed = assemble_ssh_result(
+            &t,
+            Some(255),
+            false,
+            capture(b"", false),
+            capture(
+                b"ssh: connect to host h port 22: Connection refused\nConnection closed by 10.0.0.1\n",
+                false,
+            ),
+            4,
+        );
+        assert!(mixed.dispatched);
+
+        // A plain successful run is dispatched.
+        let ok = assemble_ssh_result(
+            &t,
+            Some(0),
+            false,
+            capture(b"hi", false),
+            capture(b"", false),
+            2,
+        );
+        assert!(ok.dispatched);
     }
 
     /// The cap must actually bound the reader: 8 KiB chunks, tail kept.

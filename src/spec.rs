@@ -189,6 +189,16 @@ pub struct ExecResult {
     /// The transport client's own diagnostic lines, split out of `stderr` so
     /// the remote's output stays readable. `None` when there were none.
     pub transport_stderr: Option<String>,
+    /// Whether the command may have run.
+    ///
+    /// `false` is reported only with evidence that execution never started —
+    /// the shell binary could not be spawned, the ssh connection/auth/host-key
+    /// step or the scp upload failed, the WinRM client could not be created.
+    /// `true` is the fail-safe default: a `Connection closed by …` mid-run, a
+    /// bare ssh 255 with no diagnostics, or any completed run means the command
+    /// **may** have executed, so a caller must not blindly resubmit a
+    /// non-idempotent command.
+    pub dispatched: bool,
 }
 
 impl ExecResult {
@@ -208,6 +218,7 @@ impl ExecResult {
             shell_used: shell_used.to_string(),
             transport_error: false,
             transport_stderr: None,
+            dispatched: true,
         }
     }
 }

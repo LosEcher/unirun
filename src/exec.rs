@@ -158,6 +158,9 @@ fn run_inner(
             r.hint = Some(format!("could not spawn `{}`: {}", shell, e));
             r.stderr = format!("unirun: spawn failed: {}", e);
             r.duration_ms = start.elapsed().as_millis() as u64;
+            // Nothing was handed to a shell: this is the one local case where
+            // resubmitting is unambiguously safe.
+            r.dispatched = false;
             return r;
         }
     };
@@ -264,6 +267,7 @@ fn run_inner(
         shell_used: shell,
         transport_error: false,
         transport_stderr: None,
+        dispatched: true,
     };
     let recipe_maps = if spec.error_maps.is_empty() {
         None
@@ -666,6 +670,28 @@ mod tests {
             shell: Some(Shell::Bash),
             ..Default::default()
         }
+    }
+
+    /// A spawn failure is the one local case where nothing ran, so a caller may
+    /// safely resubmit; every completed run reports `dispatched: true`.
+    #[test]
+    fn dispatched_reflects_whether_the_command_could_have_run() {
+        let missing = ExecSpec {
+            kind: crate::spec::ExecKind::Run,
+            direct: Some(vec!["/nonexistent/unirun-probe-binary".into()]),
+            ..Default::default()
+        };
+        let failed = run(&missing);
+        assert!(
+            !failed.dispatched,
+            "nothing was handed to a shell: {failed:?}"
+        );
+        assert_eq!(failed.error_class.as_deref(), Some("COMMAND_NOT_FOUND"));
+
+        let ok = run(&sh_ok("echo hi"));
+        assert_eq!(ok.exit_code, Some(0));
+        assert!(ok.dispatched);
+        assert!(!ok.transport_error);
     }
 
     #[test]

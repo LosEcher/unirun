@@ -320,6 +320,21 @@ case-insensitive substrings on whitespace-flattened stderr; project recipe
 `[error_maps]` patterns are consulted first (project knowledge beats generic
 heuristics).
 
+### "never ran" vs "ran and failed"
+
+Every result carries `transport_error`, `transport_stderr` and `dispatched`, so
+a caller can decide whether resubmitting is safe:
+
+- `TRANSPORT` + `dispatched: false` — the ssh/scp/WinRM client failed *before*
+  the command started (connect refused, DNS, host key, auth, failed upload).
+  `stderr` holds only the remote's own output; the client's lines are moved to
+  `transport_stderr`. Retrying the submission is safe.
+- a mid-run `Connection closed by …`, or a bare ssh exit 255 with no diagnostic
+  of its own, keeps `dispatched: true`: the command **may** have executed, so a
+  non-idempotent submission must not be blindly retried.
+- a remote script that itself exits 255 is a remote failure, not a transport
+  error — the same code, distinguished by evidence rather than by the number.
+
 ### Performance benchmarks
 
 Library-level (criterion, `cargo bench`) on this M1 Mac — the full pipeline:

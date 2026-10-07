@@ -109,7 +109,14 @@ pub fn winrm_run(target: &WinrmTarget, script: &str) -> ExecResult {
     );
     let client = match WinrmClient::new(config, credentials) {
         Ok(c) => c,
-        Err(e) => return err_result(format!("winrm client init failed: {}", e), start, target),
+        Err(e) => {
+            return err_result(
+                format!("winrm client init failed: {}", e),
+                start,
+                target,
+                false,
+            );
+        }
     };
 
     let full = format!(
@@ -160,9 +167,14 @@ pub fn winrm_run(target: &WinrmTarget, script: &str) -> ExecResult {
                 shell_used: shell_used.to_string(),
                 transport_error: false,
                 transport_stderr: None,
+                dispatched: true,
             }
         }
-        Err(e) => return err_result(format!("winrm/psrp error: {}", e), start, target),
+        // The pipeline was submitted: PSRP may have executed part of it before
+        // the connection broke, so this must not claim "never ran".
+        Err(e) => {
+            return err_result(format!("winrm/psrp error: {}", e), start, target, true);
+        }
     };
     let (class, hint) = classify(&r);
     r.error_class = class;
@@ -172,7 +184,12 @@ pub fn winrm_run(target: &WinrmTarget, script: &str) -> ExecResult {
 
 /// Build the result for a transport-level WinRM failure: the command never ran,
 /// which is exactly what `transport_error` tells the caller.
-fn err_result(message: String, start: Instant, target: &WinrmTarget) -> ExecResult {
+fn err_result(
+    message: String,
+    start: Instant,
+    target: &WinrmTarget,
+    dispatched: bool,
+) -> ExecResult {
     let mut r = ExecResult::success(String::new(), String::new(), "winrm");
     r.exit_code = None;
     r.transport_error = true;
@@ -182,6 +199,7 @@ fn err_result(message: String, start: Instant, target: &WinrmTarget) -> ExecResu
         "WinRM connection to {}:{} failed; check host, port, auth, and that WinRM is enabled",
         target.host, target.port
     ));
+    r.dispatched = dispatched;
     r.duration_ms = start.elapsed().as_millis() as u64;
     r
 }
