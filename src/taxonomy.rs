@@ -26,6 +26,8 @@
 //!                                    generation token, so a detached pid could
 //!                                    not be tied to the session; fail-closed,
 //!                                    same path)
+//!   PROCESS_UNKILLABLE               (the tree survived an escalated kill —
+//!                                    `kill_status: "survived"`, structural)
 //!
 //! Matching order (first hit wins):
 //!   1. structural cases handled here (timeout / abort / POSIX exit codes)
@@ -52,6 +54,18 @@ pub fn classify_with_maps(
     r: &ExecResult,
     recipe_maps: Option<&BTreeMap<String, ErrorMapEntry>>,
 ) -> (Option<String>, Option<String>) {
+    // The tree survived even an escalated kill (D state, stuck driver): the
+    // run is over but its processes are not, which outranks the timeout that
+    // triggered the kill.
+    if r.kill_status == Some(crate::spec::KillStatus::Survived) {
+        return (
+            Some("PROCESS_UNKILLABLE".into()),
+            Some(
+                "the process tree survived an escalated kill (SIGKILL / taskkill /F) and may still be running; do not assume its side effects stopped"
+                    .into(),
+            ),
+        );
+    }
     if r.timed_out {
         return (
             Some("TIMEOUT".into()),
@@ -141,6 +155,22 @@ mod tests {
     #[test]
     fn success_is_none() {
         assert_eq!(classify(&base()), (None, None));
+    }
+
+    /// A tree that survived the escalated kill outranks the timeout that
+    /// triggered it: the run is over, its processes are not.
+    #[test]
+    fn surviving_tree_beats_timeout() {
+        let mut r = base();
+        r.timed_out = true;
+        r.kill_status = Some(crate::spec::KillStatus::Survived);
+        let (class, hint) = classify(&r);
+        assert_eq!(class.as_deref(), Some("PROCESS_UNKILLABLE"));
+        assert!(hint.unwrap_or_default().contains("survived"));
+
+        // An escalated-but-successful kill is still just a timeout.
+        r.kill_status = Some(crate::spec::KillStatus::SigkillEscalated);
+        assert_eq!(classify(&r).0.as_deref(), Some("TIMEOUT"));
     }
 
     #[test]

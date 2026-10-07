@@ -331,6 +331,7 @@ result (including `exit_code` and `error_class`) is in the JSON.
 | `SYNTAX`             | shell syntax error                              |
 | `NETWORK`            | unreachable host / repo / registry (P2)         |
 | `TRANSPORT`          | ssh/scp/winrm failed *before* the command ran (connect, auth, host key, DNS, upload) — the `transport_error` flag, with the client's own diagnostics in `transport_stderr` |
+| `PROCESS_UNKILLABLE` | the tree survived an escalated kill (`kill_status: "survived"`) — it may still be running |
 | `COMPILE_ERROR`      | compiler/toolchain diagnostics (P2)             |
 | `UNKNOWN_FAILURE`    | non-zero exit with unrecognized stderr          |
 | *(none)*             | success, or explicit non-zero exit w/o evidence |
@@ -357,6 +358,26 @@ a caller can decide whether resubmitting is safe:
   non-idempotent submission must not be blindly retried.
 - a remote script that itself exits 255 is a remote failure, not a transport
   error — the same code, distinguished by evidence rather than by the number.
+
+### Unkillable trees and untrustworthy zeroes
+
+Two more result fields exist because "the run ended" and "the run is trustworthy
+and gone" are different claims:
+
+- `kill_status` — `clean` (the tree exited on the first signal),
+  `sigkill-escalated` (SIGKILL / `taskkill /F` was needed),
+  `survived` (still alive after the escalation and a bounded wait: a process in
+  uninterruptible sleep outlives even SIGKILL, and the taxonomy reports
+  `PROCESS_UNKILLABLE` rather than a tidy `TIMEOUT`), or `unconfirmed` (the
+  signal went out but the identity probe could not confirm the pid was still
+  ours). `null` when no signal was sent.
+- `exit_code_confidence` — `observed` when the status is evidence, `unknown`
+  when a **zero** came from a local PowerShell run: PowerShell does not
+  propagate native exit codes and the local `-Command` path appends no
+  `exit $LASTEXITCODE`, so `0` cannot distinguish "all good" from "a native
+  command failed". The ssh and WinRM paths do apply an exit contract (and the
+  cmd path now appends `exit /b %ERRORLEVEL%`), so a non-zero status and every
+  remote status stay `observed`.
 
 ### Performance benchmarks
 

@@ -151,6 +151,62 @@ impl ExecSpec {
     }
 }
 
+/// What happened when unirun terminated the process tree.
+///
+/// Reported only when a signal was actually sent (`None` otherwise). The
+/// distinction matters because "the run ended" and "the run's processes are
+/// gone" are different facts: a process in uninterruptible sleep survives even
+/// `SIGKILL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KillStatus {
+    /// The tree exited on the first signal (SIGTERM / `taskkill`).
+    Clean,
+    /// `SIGKILL` (or the force flag) was needed after the grace period.
+    SigkillEscalated,
+    /// Still alive after the escalation and a bounded settle wait — an
+    /// unkillable process (D state, stuck driver). The tree may outlive unirun.
+    Survived,
+    /// The signal went out, but the identity probe could not confirm the pid
+    /// still belonged to the process unirun started.
+    Unconfirmed,
+}
+
+impl KillStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KillStatus::Clean => "clean",
+            KillStatus::SigkillEscalated => "sigkill-escalated",
+            KillStatus::Survived => "survived",
+            KillStatus::Unconfirmed => "unconfirmed",
+        }
+    }
+}
+
+/// Whether the exit status is evidence for the outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExitCodeConfidence {
+    /// The status is the executed program's own (POSIX shells, direct argv,
+    /// transports that append an explicit exit contract).
+    Observed,
+    /// A zero status cannot distinguish "everything succeeded" from "a native
+    /// command failed inside PowerShell": PowerShell does not propagate native
+    /// exit codes, and the local `-Command` path appends no
+    /// `exit $LASTEXITCODE`. A **non-zero** status is still `Observed` — only a
+    /// zero is unverifiable this way.
+    Unknown,
+}
+
+impl ExitCodeConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExitCodeConfidence::Observed => "observed",
+            ExitCodeConfidence::Unknown => "unknown",
+        }
+    }
+}
+
 /// The normalized result — same shape on every platform, stable schema (semver).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecResult {
@@ -199,6 +255,11 @@ pub struct ExecResult {
     /// **may** have executed, so a caller must not blindly resubmit a
     /// non-idempotent command.
     pub dispatched: bool,
+    /// What happened when unirun terminated the tree; `None` when no signal was
+    /// sent (the process exited on its own).
+    pub kill_status: Option<KillStatus>,
+    /// Whether `exit_code` is evidence for the outcome.
+    pub exit_code_confidence: ExitCodeConfidence,
 }
 
 impl ExecResult {
@@ -219,6 +280,8 @@ impl ExecResult {
             transport_error: false,
             transport_stderr: None,
             dispatched: true,
+            kill_status: None,
+            exit_code_confidence: ExitCodeConfidence::Observed,
         }
     }
 }

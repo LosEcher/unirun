@@ -12,7 +12,7 @@
 //! travels over stdin to `<shell> -s`, so no outer quoting layer can corrupt
 //! it, and the script's own exit code propagates exactly.
 
-use crate::spec::{ExecResult, Shell, DEFAULT_MAX_OUTPUT_BYTES};
+use crate::spec::{ExecResult, ExitCodeConfidence, KillStatus, Shell, DEFAULT_MAX_OUTPUT_BYTES};
 use crate::taxonomy::classify;
 use base64::Engine;
 use std::io::{Read, Write};
@@ -228,7 +228,7 @@ fn ssh_powershell(target: &SshTarget, script: &str) -> ExecResult {
 /// content stays ASCII-safe per win-exec guidance).
 fn ssh_cmd_file(target: &SshTarget, script: &str) -> ExecResult {
     let remote_path = format!(r"C:\Windows\Temp\unirun-{}.bat", nonce());
-    if let Err(e) = upload_scp(target, &remote_path, script.as_bytes()) {
+    if let Err(e) = upload_scp(target, &remote_path, &cmd_payload(script)) {
         return upload_failed("cmd", e);
     }
     let remote_cmd = format!("cmd.exe /C \"{}\"", remote_path);
@@ -292,6 +292,7 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) ->
     let grace = Duration::from_millis(2_000);
     let mut exit_code = None;
     let mut timed_out = false;
+    let mut kill_status: Option<KillStatus> = None;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -301,10 +302,7 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) ->
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     timed_out = true;
-                    #[cfg(unix)]
-                    kill_ssh_tree(&mut child, grace);
-                    #[cfg(windows)]
-                    kill_ssh_tree(&child, grace);
+                    kill_status = Some(kill_ssh_tree(&mut child, grace));
                     let _ = child.wait();
                     break;
                 }
@@ -322,6 +320,7 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) ->
         target,
         exit_code,
         timed_out,
+        kill_status,
         StreamCapture {
             bytes: out_bytes,
             truncated: out_truncated,
@@ -354,10 +353,12 @@ fn output_cap(target: &SshTarget) -> usize {
 /// Extracted from `run_ssh` so the truncation flags `read_capped` produces are
 /// provably *not* dropped on the way into `ExecResult` — the bug this function
 /// exists to prevent — without needing a live host in the test suite.
+#[allow(clippy::too_many_arguments)]
 fn assemble_ssh_result(
     target: &SshTarget,
     exit_code: Option<i32>,
     timed_out: bool,
+    kill_status: Option<KillStatus>,
     stdout_capture: StreamCapture,
     stderr_capture: StreamCapture,
     duration_ms: u64,
@@ -402,6 +403,8 @@ fn assemble_ssh_result(
         transport_error,
         transport_stderr,
         dispatched,
+        kill_status,
+        exit_code_confidence: ExitCodeConfidence::Observed,
     };
     let (class, hint) = classify(&result);
     result.error_class = class;
@@ -445,6 +448,16 @@ fn ssh_argv(target: &SshTarget, remote_cmd: &str) -> Vec<String> {
     args.push(host);
     args.push(remote_cmd.to_string());
     args
+}
+
+/// The batch payload: the script plus an explicit exit-code contract.
+///
+/// `cmd.exe /C file.bat` normally returns the script's last errorlevel, but a
+/// trailing statement can reset it — win-exec appended the contract for exactly
+/// that reason (`win-exec/win-exec.py:234`). With it, a cmd run's exit status is
+/// evidence, so `exit_code_confidence` stays `observed`.
+fn cmd_payload(script: &str) -> Vec<u8> {
+    format!("{}\r\nexit /b %ERRORLEVEL%\r\n", script.trim_end()).into_bytes()
 }
 
 /// Upload bytes as a temp file on the remote host via scp.
@@ -567,29 +580,33 @@ fn read_capped<R: Read>(mut reader: R, max: usize) -> (Vec<u8>, bool) {
 }
 
 #[cfg(unix)]
-fn kill_ssh_tree(child: &mut Child, grace: Duration) {
+fn kill_ssh_tree(child: &mut Child, grace: Duration) -> KillStatus {
     let pid = child.id() as i32;
     unsafe { libc::kill(-pid, libc::SIGTERM) };
     let deadline = Instant::now() + grace;
     loop {
         if let Ok(Some(_)) = child.try_wait() {
-            return;
+            return KillStatus::Clean;
         }
         if Instant::now() >= deadline {
             unsafe { libc::kill(-pid, libc::SIGKILL) };
-            return;
+            return crate::exec::settle_after_kill(child);
         }
         thread::sleep(Duration::from_millis(10));
     }
 }
 
 #[cfg(windows)]
-fn kill_ssh_tree(child: &Child, _grace: Duration) {
+fn kill_ssh_tree(child: &mut Child, _grace: Duration) -> KillStatus {
     let _ = Command::new("taskkill")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    match crate::exec::settle_after_kill(child) {
+        KillStatus::Clean => KillStatus::SigkillEscalated,
+        other => other,
+    }
 }
 
 /// Lines the `ssh`/`scp` clients write about *themselves*. Matching one of
@@ -731,6 +748,7 @@ mod tests {
             &t,
             Some(0),
             false,
+            None,
             capture(b"tail-of-stdout", true),
             capture(b"", false),
             7,
@@ -743,6 +761,7 @@ mod tests {
             &t,
             Some(0),
             false,
+            None,
             capture(b"", false),
             capture(b"tail-of-stderr", true),
             3,
@@ -759,6 +778,7 @@ mod tests {
             &t,
             None,
             true,
+            None,
             capture(b"partial", false),
             capture(b"", false),
             1,
@@ -780,6 +800,7 @@ mod tests {
             &t,
             Some(255),
             false,
+            None,
             capture(b"", false),
             capture(
                 b"ssh: connect to host h.example port 22: Connection refused\n",
@@ -803,6 +824,7 @@ mod tests {
             &t,
             Some(255),
             false,
+            None,
             capture(b"", false),
             capture(b"Permission denied (publickey).\n", false),
             4,
@@ -821,6 +843,7 @@ mod tests {
             &t,
             Some(255),
             false,
+            None,
             capture(b"", false),
             capture(
                 b"Failed to connect to db port 5432: Connection refused\n",
@@ -843,6 +866,7 @@ mod tests {
             &t,
             Some(255),
             false,
+            None,
             capture(b"", false),
             capture(
                 b"remote warning\nssh: connect to host h port 22: timed out\n",
@@ -867,6 +891,7 @@ mod tests {
             &t,
             Some(255),
             true,
+            None,
             capture(b"", false),
             capture(b"ssh: connect to host h port 22: timed out\n", false),
             4,
@@ -897,6 +922,7 @@ mod tests {
             &t,
             Some(255),
             false,
+            None,
             capture(b"", false),
             capture(
                 b"ssh: connect to host h port 22: Connection refused\n",
@@ -914,6 +940,7 @@ mod tests {
             &t,
             Some(255),
             false,
+            None,
             capture(b"", false),
             capture(b"Permission denied (publickey).\n", false),
             4,
@@ -925,6 +952,7 @@ mod tests {
             &t,
             Some(255),
             false,
+            None,
             capture(b"", false),
             capture(b"Connection closed by 10.0.0.1 port 22\n", false),
             4,
@@ -940,6 +968,7 @@ mod tests {
             &t,
             Some(255),
             false,
+            None,
             capture(b"", false),
             capture(
                 b"ssh: connect to host h port 22: Connection refused\nConnection closed by 10.0.0.1\n",
@@ -954,6 +983,7 @@ mod tests {
             &t,
             Some(0),
             false,
+            None,
             capture(b"hi", false),
             capture(b"", false),
             2,

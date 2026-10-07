@@ -10,7 +10,7 @@
 //!
 //! Compile with `--features winrm` (pulls tokio + reqwest via psrp-rs).
 
-use crate::spec::ExecResult;
+use crate::spec::{ExecResult, ExitCodeConfidence};
 use crate::taxonomy::classify;
 use psrp_rs::blocking::run_pipeline;
 use psrp_rs::clixml::PsValue;
@@ -168,6 +168,10 @@ pub fn winrm_run(target: &WinrmTarget, script: &str) -> ExecResult {
                 transport_error: false,
                 transport_stderr: None,
                 dispatched: true,
+                kill_status: None,
+                // The `$LASTEXITCODE` sentinel is an explicit contract, so the
+                // status it reports is evidence.
+                exit_code_confidence: ExitCodeConfidence::Observed,
             }
         }
         // The pipeline was submitted: PSRP may have executed part of it before

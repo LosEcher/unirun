@@ -19,7 +19,7 @@ use crate::coalesce::{CoalesceConfig, CoalescePolicy, OutputCoalescer};
 use crate::encoding::decode_with;
 use crate::probe::which;
 use crate::process_identity::{self, ExpectedIdentity, IdentityVerdict};
-use crate::spec::{ExecKind, ExecResult, ExecSpec, Shell};
+use crate::spec::{ExecKind, ExecResult, ExecSpec, ExitCodeConfidence, KillStatus, Shell};
 use crate::taxonomy::classify_with_maps;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
@@ -214,7 +214,10 @@ fn run_inner(
     // the pid (unreadable probe, or a child that re-exec'd away its token).
     // The kill still happens — see `kill_gate` — so this only annotates the
     // result instead of replacing its classification.
-    let mut identity_unconfirmed: Option<IdentityVerdict> = None;
+    let mut kill_attempt = KillAttempt {
+        outcome: None,
+        identity_unconfirmed: None,
+    };
 
     // Deadline + abort polling loop.
     loop {
@@ -227,12 +230,12 @@ fn run_inner(
             Ok(None) => {
                 if abort.load(Ordering::SeqCst) {
                     aborted = true;
-                    identity_unconfirmed = kill_tree_of_owned_child(&mut child, grace, &identity);
+                    kill_attempt = kill_tree_of_owned_child(&mut child, grace, &identity);
                     break;
                 }
                 if start.elapsed() >= timeout {
                     timed_out = true;
-                    identity_unconfirmed = kill_tree_of_owned_child(&mut child, grace, &identity);
+                    kill_attempt = kill_tree_of_owned_child(&mut child, grace, &identity);
                     break;
                 }
                 thread::sleep(Duration::from_millis(5));
@@ -268,6 +271,10 @@ fn run_inner(
         transport_error: false,
         transport_stderr: None,
         dispatched: true,
+        // Filled in once the run ends: both are properties of how *this* run
+        // terminated, not of the spec.
+        kill_status: None,
+        exit_code_confidence: ExitCodeConfidence::Observed,
     };
     let recipe_maps = if spec.error_maps.is_empty() {
         None
@@ -280,14 +287,34 @@ fn run_inner(
     // The tree was signalled on the owned-child guarantee (see `kill_gate`),
     // not on a verified pid: keep that visible instead of silently claiming
     // the identity layer confirmed it.
-    if let Some(verdict) = identity_unconfirmed {
+    if let Some(verdict) = kill_attempt.identity_unconfirmed.take() {
         let note = format!("tree kill not identity-confirmed: {}", verdict.describe());
         result.hint = Some(match result.hint.take() {
             Some(existing) => format!("{}; {}", existing, note),
             None => note,
         });
     }
+    result.kill_status = kill_attempt.status();
+    result.exit_code_confidence = local_exit_code_confidence(spec, &result);
     result
+}
+
+/// Is this run's exit status evidence for its outcome?
+///
+/// Everything but one case is `Observed`. The exception is a **zero** status
+/// from a local PowerShell `-Command` run: PowerShell does not propagate native
+/// exit codes, and unlike the ssh transport this path appends no
+/// `exit $LASTEXITCODE`, so a failing native command inside the script can
+/// still leave `0` behind. A non-zero status is itself the evidence (something
+/// deliberately set it), so only zero is unverifiable.
+fn local_exit_code_confidence(spec: &ExecSpec, result: &ExecResult) -> ExitCodeConfidence {
+    if spec.direct.is_some() || result.exit_code != Some(0) {
+        return ExitCodeConfidence::Observed;
+    }
+    match result.shell_used.as_str() {
+        "powershell" | "pwsh" => ExitCodeConfidence::Unknown,
+        _ => ExitCodeConfidence::Observed,
+    }
 }
 
 /// Resolve which shell to use: explicit wins, else kind/extension-aware default.
@@ -524,9 +551,13 @@ fn join_capture(t: Option<thread::JoinHandle<Captured>>) -> (Vec<u8>, bool) {
     }
 }
 
+/// How long to wait for an escalated (SIGKILL / `taskkill /F`) kill to take
+/// effect before calling the process unkillable.
+pub(crate) const SIGKILL_SETTLE: Duration = Duration::from_millis(500);
+
 /// Terminate the whole process tree: SIGTERM, then SIGKILL after grace.
 #[cfg(unix)]
-fn kill_tree(child: &mut Child, grace: Duration) {
+fn kill_tree(child: &mut Child, grace: Duration) -> KillStatus {
     let pid = child.id() as i32;
     // The child is its own process-group leader (process_group(0)); negative
     // pid signals the entire group, so pipelines/subshells die together.
@@ -534,11 +565,14 @@ fn kill_tree(child: &mut Child, grace: Duration) {
     let deadline = Instant::now() + grace;
     loop {
         if let Ok(Some(_)) = child.try_wait() {
-            return;
+            return KillStatus::Clean;
         }
         if Instant::now() >= deadline {
             unsafe { libc::kill(-pid, libc::SIGKILL) };
-            return;
+            // SIGKILL cannot be caught, but a process in uninterruptible sleep
+            // (D state — a blocked network filesystem, a stuck driver) survives
+            // it. Say so instead of implying the tree is gone.
+            return settle_after_kill(child);
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -546,7 +580,7 @@ fn kill_tree(child: &mut Child, grace: Duration) {
 
 /// Windows tree termination via `taskkill /T /F` (P0: contained best-effort).
 #[cfg(windows)]
-fn kill_tree(child: &Child, _grace: Duration) {
+fn kill_tree(child: &mut Child, _grace: Duration) -> KillStatus {
     // taskkill writes "SUCCESS: ... terminated." to stdout — silence it so
     // protocol streams (e.g. MCP) stay clean.
     let _ = Command::new("taskkill")
@@ -554,6 +588,30 @@ fn kill_tree(child: &Child, _grace: Duration) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    // `/F` *is* the force path: there is no softer escalation to distinguish,
+    // so a successful termination is reported as an escalated one.
+    match settle_after_kill(child) {
+        KillStatus::Clean => KillStatus::SigkillEscalated,
+        other => other,
+    }
+}
+
+/// Bounded wait after an escalated kill: exited → escalated, still running →
+/// survived.
+pub(crate) fn settle_after_kill(child: &mut Child) -> KillStatus {
+    let deadline = Instant::now() + SIGKILL_SETTLE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return KillStatus::SigkillEscalated,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return KillStatus::Survived;
+                }
+            }
+            Err(_) => return KillStatus::SigkillEscalated,
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Bounded grace for a freshly spawned child to `exec`, used by
@@ -626,25 +684,45 @@ fn kill_gate(verdict: &IdentityVerdict) -> KillGate {
     }
 }
 
-/// Terminate the tree of the child we own, per [`kill_gate`]. Returns the
-/// verdict to report when the probe did not confirm the identity, and `None`
-/// when it matched or there was nothing to kill.
+/// The result of one kill attempt.
+struct KillAttempt {
+    /// `None` when no signal was sent.
+    outcome: Option<KillStatus>,
+    /// The verdict to report when the probe did not confirm the identity; the
+    /// outcome is downgraded to [`KillStatus::Unconfirmed`] in that case.
+    identity_unconfirmed: Option<IdentityVerdict>,
+}
+
+impl KillAttempt {
+    fn status(&self) -> Option<KillStatus> {
+        match (self.outcome, self.identity_unconfirmed.is_some()) {
+            (None, _) => None,
+            (Some(_), true) => Some(KillStatus::Unconfirmed),
+            (Some(s), false) => Some(s),
+        }
+    }
+}
+
+/// Terminate the tree of the child we own, per [`kill_gate`].
 fn kill_tree_of_owned_child(
     child: &mut Child,
     grace: Duration,
     identity: &ExpectedIdentity,
-) -> Option<IdentityVerdict> {
+) -> KillAttempt {
     let verdict = verify_before_kill(identity, KILL_IDENTITY_SETTLE);
     match kill_gate(&verdict) {
-        KillGate::Skip => None,
-        KillGate::Signal => {
-            kill_tree(child, grace);
-            None
-        }
-        KillGate::SignalUnconfirmed => {
-            kill_tree(child, grace);
-            Some(verdict)
-        }
+        KillGate::Skip => KillAttempt {
+            outcome: None,
+            identity_unconfirmed: None,
+        },
+        KillGate::Signal => KillAttempt {
+            outcome: Some(kill_tree(child, grace)),
+            identity_unconfirmed: None,
+        },
+        KillGate::SignalUnconfirmed => KillAttempt {
+            outcome: Some(kill_tree(child, grace)),
+            identity_unconfirmed: Some(verdict),
+        },
     }
 }
 
@@ -670,6 +748,113 @@ mod tests {
             shell: Some(Shell::Bash),
             ..Default::default()
         }
+    }
+
+    /// A run that ignores SIGTERM must be reported as an escalated kill, not as
+    /// a clean termination (and not as unkillable — SIGKILL does work).
+    #[cfg(unix)]
+    #[test]
+    fn a_term_ignoring_child_reports_an_escalated_kill() {
+        let mut spec = sh_ok("trap '' TERM; sleep 30");
+        spec.timeout_ms = 300;
+        spec.grace_ms = 200;
+        let r = run(&spec);
+        assert!(r.timed_out, "deadline must have elapsed: {r:?}");
+        assert_eq!(
+            r.kill_status,
+            Some(KillStatus::SigkillEscalated),
+            "SIGKILL was required: {r:?}"
+        );
+        assert_eq!(r.error_class.as_deref(), Some("TIMEOUT"));
+    }
+
+    /// A run that exits on SIGTERM reports a clean kill.
+    #[cfg(unix)]
+    #[test]
+    fn a_cooperative_child_reports_a_clean_kill() {
+        let mut spec = sh_ok("sleep 30");
+        spec.timeout_ms = 300;
+        spec.grace_ms = 2_000;
+        let r = run(&spec);
+        assert!(r.timed_out);
+        assert_eq!(r.kill_status, Some(KillStatus::Clean), "{r:?}");
+    }
+
+    /// No signal, no `kill_status`: the process ended on its own.
+    #[test]
+    fn a_completed_run_has_no_kill_status() {
+        let r = run(&sh_ok("echo done"));
+        assert_eq!(r.kill_status, None);
+        assert_eq!(r.exit_code_confidence, ExitCodeConfidence::Observed);
+    }
+
+    /// The kill-outcome state machine, including the unkillable case a live test
+    /// cannot produce portably (a process in D state).
+    #[test]
+    fn kill_status_maps_the_attempt() {
+        let attempt = |outcome: Option<KillStatus>, unconfirmed: bool| KillAttempt {
+            outcome,
+            identity_unconfirmed: unconfirmed.then_some(IdentityVerdict::Unverifiable),
+        };
+        assert_eq!(attempt(None, false).status(), None);
+        assert_eq!(
+            attempt(Some(KillStatus::Clean), false).status(),
+            Some(KillStatus::Clean)
+        );
+        assert_eq!(
+            attempt(Some(KillStatus::Survived), false).status(),
+            Some(KillStatus::Survived)
+        );
+        assert_eq!(
+            attempt(Some(KillStatus::Clean), true).status(),
+            Some(KillStatus::Unconfirmed),
+            "an unconfirmed identity outranks the signal outcome"
+        );
+    }
+
+    /// Only a **zero** exit status from a local PowerShell `-Command` run is
+    /// unverifiable: PowerShell does not propagate native exit codes and this
+    /// path appends no `exit $LASTEXITCODE`. Everything else is evidence.
+    #[test]
+    fn exit_code_confidence_is_unknown_only_for_powershell_zero() {
+        let ps = ExecSpec {
+            command: "Get-Item /nope".into(),
+            shell: Some(Shell::Powershell),
+            ..Default::default()
+        };
+        let mut zero = ExecResult::success(String::new(), String::new(), "powershell");
+        assert_eq!(
+            local_exit_code_confidence(&ps, &zero),
+            ExitCodeConfidence::Unknown
+        );
+
+        zero.exit_code = Some(1);
+        assert_eq!(
+            local_exit_code_confidence(&ps, &zero),
+            ExitCodeConfidence::Observed,
+            "a non-zero status is its own evidence"
+        );
+
+        let bash = ExecSpec {
+            command: "echo hi".into(),
+            shell: Some(Shell::Bash),
+            ..Default::default()
+        };
+        let mut ok = ExecResult::success(String::new(), String::new(), "bash");
+        ok.exit_code = Some(0);
+        assert_eq!(
+            local_exit_code_confidence(&bash, &ok),
+            ExitCodeConfidence::Observed
+        );
+
+        let direct = ExecSpec {
+            direct: Some(vec!["/bin/true".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            local_exit_code_confidence(&direct, &zero),
+            ExitCodeConfidence::Observed
+        );
     }
 
     /// A spawn failure is the one local case where nothing ran, so a caller may
