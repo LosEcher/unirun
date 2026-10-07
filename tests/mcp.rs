@@ -86,6 +86,36 @@ fn mcp_initialize_and_list_tools() {
     assert!(names.contains(&"exec.run"));
     assert!(names.contains(&"exec.script"));
     assert!(names.contains(&"exec.probe"));
+    assert!(
+        names.contains(&"exec.capabilities"),
+        "agents must be able to ask what this build can do: {names:?}"
+    );
+    s.close();
+}
+
+/// `exec.capabilities` is the MCP half of `unirun capabilities --json`: a
+/// consumer gates on behaviour keys instead of parsing `--version`.
+#[test]
+fn mcp_exec_capabilities_describes_the_build() {
+    let mut s = McpSession::start();
+    s.request_ok("initialize", serde_json::json!({}));
+    let result = s.request_ok(
+        "tools/call",
+        serde_json::json!({ "name": "exec.capabilities", "arguments": {} }),
+    );
+    assert_eq!(result["isError"], serde_json::json!(false), "{}", result);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["unirun"]["version"], env!("CARGO_PKG_VERSION"));
+    let features: Vec<&str> = parsed["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    for key in ["ssh", "ssh-workdir-env", "strict-flags", "dispatched"] {
+        assert!(features.contains(&key), "missing `{key}` in {features:?}");
+    }
     s.close();
 }
 

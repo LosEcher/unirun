@@ -124,6 +124,7 @@ cd unirun && cargo build --release
 unirun run '<command>' [--timeout 30] [--shell bash] [--workdir dir] [--env K=V] [--max-output N] [--output-encoding NAME] [--no-coalesce]
 unirun script path/to/script [options]     # shell inferred from extension
 unirun probe [--json]                      # host capability snapshot
+unirun capabilities [--json]               # what this build can do (for consumers)
 unirun mcp                                 # serve MCP over stdio (agents)
 unirun acp                                 # serve Agent Client Protocol v1 over stdio
 unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--workdir dir] [--env K=V] [--timeout N] [--max-output N] [--output-encoding NAME]   # remote SSH
@@ -138,12 +139,34 @@ command or to the remote script. Use `--` when an argument to the command
 starts with a dash (`unirun run 'echo' --json -- --not-a-flag`); single-dash
 tokens like `-la` are positional, since they belong to the command.
 
+### Consumers: ask what the build can do, don't parse a version
+
+`unirun capabilities --json` (also MCP `exec.capabilities`) answers "does this
+binary reject unknown flags? does its `ssh` take `--workdir`? is WinRM compiled
+in?" with stable **capability keys**, so a caller never has to keep a
+version→feature table:
+
+```json
+{"unirun":{"version":"0.5.0","schema":1},
+ "platform":{"os":"macos","arch":"aarch64"},
+ "features":["local-exec","probe","mcp","acp","bg-session","recipe-registry",
+             "recipe-toolchain","ssh","ssh-identity","ssh-workdir-env",
+             "error-taxonomy","output-cap","truncation-flag","transport-error",
+             "dispatched","legacy-codepage","encoding-hint","strict-flags"]}
+```
+
+Keys are added, never renamed or removed; `schema` changes only if the document
+shape does. A caller that misses a key it needs should fall back to its own
+precedent behaviour rather than assume the capability is absent.
+
 ### MCP — plug into any agent
 
 `unirun mcp` is a stdio MCP server exposing `exec.run`, `exec.script`,
 `exec.probe` and the background-session tools `session.start`, `session.status`,
 `session.output`, `session.kill`, `session.wait`, `session.list`
-(JSON-RPC 2.0, newline-delimited). Point any MCP-capable agent at it:
+(JSON-RPC 2.0, newline-delimited). `exec.capabilities` reports what the build
+can do, same payload as `unirun capabilities --json`.
+Point any MCP-capable agent at it:
 
 ```json
 // Claude Desktop / Cursor / DSH mcp config

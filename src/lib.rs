@@ -5,6 +5,7 @@
 //! (see `main.rs`), plus the optional `winrm`-feature WinRM provider.
 
 pub mod acp;
+pub mod capabilities;
 pub mod coalesce;
 pub mod encoding;
 pub mod error_maps;
@@ -22,6 +23,9 @@ pub mod transport;
 pub mod winrm;
 
 pub use exec::{install_sigint_handler, reset_abort, run};
+// NB: `probe::Capabilities` is the *host* matrix (shells/tools); the build's
+// own capability list is `capabilities::BuildCapabilities`, deliberately not
+// re-exported here so the two can never be confused at a call site.
 pub use probe::{probe, Capabilities};
 pub use spec::{ExecKind, ExecResult, ExecSpec, Shell};
 pub use transport::{ssh_run, SshTarget};

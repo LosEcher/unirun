@@ -46,6 +46,7 @@ pub fn serve() -> std::io::Result<()> {
                     exec_run_tool(),
                     exec_script_tool(),
                     exec_probe_tool(),
+                    exec_capabilities_tool(),
                     session_start_tool(),
                     session_status_tool(),
                     session_output_tool(),
@@ -159,6 +160,15 @@ fn exec_probe_tool() -> Value {
     tool_schema("exec.probe", "Return host capabilities: platform, shells, coreutils (e.g. GNU timeout availability), tools.", json!({}), &[])
 }
 
+fn exec_capabilities_tool() -> Value {
+    tool_schema(
+        "exec.capabilities",
+        "Return what this unirun build can do as stable capability keys (plus version and schema), so callers gate on behaviour instead of parsing --version.",
+        json!({}),
+        &[],
+    )
+}
+
 fn session_start_tool() -> Value {
     let mut props = common_properties();
     props["command"] =
@@ -263,6 +273,13 @@ fn call_tool(name: &str, args: &Value) -> (String, bool) {
         }
         "exec.probe" => {
             let caps = probe::probe();
+            (
+                serde_json::to_string(&caps).unwrap_or_else(|_| "{}".into()),
+                false,
+            )
+        }
+        "exec.capabilities" => {
+            let caps = crate::capabilities::capabilities();
             (
                 serde_json::to_string(&caps).unwrap_or_else(|_| "{}".into()),
                 false,

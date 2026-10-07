@@ -23,6 +23,8 @@ USAGE:
   unirun run '<command>' [options]      run a command through a shell
   unirun script <file> [options]        run a script file (shell by extension)
   unirun probe [--json]                 show host capabilities
+  unirun capabilities [--json]          show what this build can do (versions →
+                                        capability keys; for consumers)
   unirun mcp                            serve the MCP protocol over stdio
   unirun acp                            serve the Agent Client Protocol over stdio
   unirun ssh <host> '<script>' [opts]  run a script on a remote host (Unix or Windows)
@@ -82,6 +84,7 @@ fn main() -> ExitCode {
         "run" => cmd_run(&args[1..]),
         "script" => cmd_script(&args[1..]),
         "probe" => cmd_probe(&args[1..]),
+        "capabilities" => cmd_capabilities(&args[1..]),
         "ssh" => cmd_ssh(&args[1..]),
         "winrm" => cmd_winrm(&args[1..]),
         "recipe" => cmd_recipe(&args[1..]),
@@ -492,6 +495,36 @@ fn cmd_ssh(args: &[String]) -> ExitCode {
     let script = positional[1..].join(" ");
     let result = unirun::ssh_run(&target, &script);
     emit(&result, &opts, opts.pretty)
+}
+
+fn cmd_capabilities(args: &[String]) -> ExitCode {
+    // No positionals: this describes the binary, it does not take input.
+    for a in args {
+        if !matches!(a.as_str(), "--json" | "--pretty") {
+            eprintln!("unirun capabilities: {}", unknown_flag_error(a));
+            return ExitCode::from(2);
+        }
+    }
+    let caps = unirun::capabilities::capabilities();
+    if args.iter().any(|a| a == "--json" || a == "--pretty") {
+        let out = if args.iter().any(|a| a == "--pretty") {
+            serde_json::to_string_pretty(&caps).unwrap_or_default()
+        } else {
+            serde_json::to_string(&caps).unwrap_or_default()
+        };
+        println!("{}", out);
+    } else {
+        println!(
+            "unirun {} (capabilities schema {})",
+            caps.unirun.version, caps.unirun.schema
+        );
+        println!("platform: {} ({})", caps.platform.os, caps.platform.arch);
+        println!("features:");
+        for f in &caps.features {
+            println!("  {}", f);
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_probe(args: &[String]) -> ExitCode {

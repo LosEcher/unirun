@@ -95,3 +95,32 @@ fn known_flags_still_work_after_the_contract() {
     let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(parsed["platform"].is_string());
 }
+
+#[test]
+fn capabilities_reports_feature_keys() {
+    let out = unirun(&["capabilities", "--json"]);
+    assert!(out.status.success(), "stderr: {:?}", out.stderr);
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed["unirun"]["version"], env!("CARGO_PKG_VERSION"));
+    let features: Vec<&str> = parsed["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    // The keys los needs to delete its version→capability table.
+    for key in ["ssh-identity", "ssh-workdir-env", "strict-flags"] {
+        assert!(features.contains(&key), "missing `{key}`: {features:?}");
+    }
+
+    let human = unirun(&["capabilities"]);
+    assert!(human.status.success());
+    assert!(String::from_utf8_lossy(&human.stdout).contains("features:"));
+}
+
+#[test]
+fn capabilities_rejects_unknown_arguments() {
+    let out = unirun(&["capabilities", "--wat"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown flag `--wat`"));
+}

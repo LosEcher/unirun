@@ -43,7 +43,7 @@
 | A1 未知 flag fail-closed | ✅ 已完成 | 未知 `--flag` → exit 2（不再拼进命令/远端脚本）；`--flag=value` 与 `--` 逃生口；`tests/cli_args.rs` 8 例 |
 | A16 `transport_error` | ✅ 已完成 | 新增 `transport_error`/`transport_stderr` 字段 + taxonomy 类 `TRANSPORT`；255 需有 ssh 自身诊断证据；真实「连接被拒」集成测试 |
 | A13 `dispatched` | ✅ 已完成 | 新增 `dispatched`（只有前派发证据才为 false：spawn 失败/连接/认证/上传）；远端 255 与中途断连保守为 true；README 增「never ran vs ran and failed」节 |
-| A10 `capabilities --json` | ⏳ 待办 | |
+| A10 `capabilities --json` | ✅ 已完成 | 新增 `capabilities` 子命令 + MCP `exec.capabilities`（18 个稳定能力键，schema=1；`winrm` 随 feature 出现）；5 单测 + CLI/MCP 集成测试；README 增「Consumers: ask what the build can do」 |
 | A11 README 重试/unknown 语义 | ⏳ 待办 | |
 | A2–A5（取消与 kill 语义） | ⏳ 待办 | |
 | A6–A8、A12（会话/探测/平台差异） | ⏳ 待办 | |
