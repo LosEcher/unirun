@@ -35,6 +35,7 @@ pub const FEATURE_KEYS: &[&str] = &[
     "mcp-cancel", // notifications/cancelled stops a running exec.*
     "acp",
     "bg-session",
+    "session-cursor", // bg output --since / MCP cursor: read only what is new
     "recipe-registry",
     "recipe-toolchain",
     // Remote execution.

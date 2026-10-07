@@ -186,3 +186,65 @@ fn cli_bg_missing_id_usage_error() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// Cursors turn "read the tail again" into "read what is new": the first page
+/// carries the whole log and a `next_cursor`, the second page read from that
+/// cursor carries nothing (no repeats), and a later read carries only the
+/// appended bytes.
+#[test]
+fn library_output_since_is_incremental() {
+    with_home("cursor", |_| {
+        let spec = unirun::spec::ExecSpec {
+            command: output_cmd().into(),
+            ..Default::default()
+        };
+        let id = unirun::session::start(&spec, "cursor-test")
+            .expect("start")
+            .id;
+        let done = unirun::session::wait(&id, 15_000).expect("wait");
+        assert_eq!(done.status, "completed", "state: {:?}", done);
+
+        let first = unirun::session::output_since(&id, 0).expect("first page");
+        assert!(first.stdout.contains("one") && first.stdout.contains("two"));
+        assert!(first.stderr.to_lowercase().contains("warn"));
+        assert!(first.next_cursor > 0);
+        assert!(!first.reset);
+
+        // Nothing new since the cursor: empty, same cursor.
+        let second = unirun::session::output_since(&id, first.next_cursor).expect("second page");
+        assert_eq!(second.stdout, "", "no repeats allowed: {:?}", second);
+        assert_eq!(second.stderr, "");
+        assert_eq!(second.next_cursor, first.next_cursor);
+
+        // A stale cursor reports a reset instead of silently returning junk.
+        let stale = unirun::session::output_since(&id, first.next_cursor + 1_000).expect("stale");
+        assert!(
+            stale.reset,
+            "a cursor past the end must resync: {:?}",
+            stale
+        );
+        assert_eq!(stale.stdout, "");
+        assert_eq!(stale.next_cursor, first.next_cursor);
+    });
+}
+
+/// `next_cursor` is a byte offset, and a cursor that lands mid-codepoint (only
+/// reachable if a caller invents one) must not produce invalid text.
+#[test]
+fn library_output_since_respects_char_boundaries() {
+    with_home("cursor-boundary", |_| {
+        let spec = unirun::spec::ExecSpec {
+            command: "printf '中文'\\n".into(),
+            ..Default::default()
+        };
+        let id = unirun::session::start(&spec, "boundary").expect("start").id;
+        unirun::session::wait(&id, 15_000).expect("wait");
+        let page = unirun::session::output_since(&id, 1).expect("mid-codepoint start");
+        assert!(
+            page.stdout.contains('文'),
+            "must advance to the next boundary, not emit U+FFFD: {:?}",
+            page.stdout
+        );
+        assert!(!page.stdout.contains('\u{FFFD}'));
+    });
+}

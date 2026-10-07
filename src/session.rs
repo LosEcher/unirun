@@ -363,6 +363,84 @@ pub fn output(id: &str, tail_bytes: usize) -> Result<(String, String, bool), Str
     Ok((so, se, st.truncated_log))
 }
 
+/// One incremental page of a session's logs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OutputPage {
+    pub id: String,
+    pub stdout: String,
+    pub stderr: String,
+    /// Pass this back as `--since` to get only what was appended afterwards.
+    ///
+    /// Logs are append-only and stop at [`LOG_CAP`], never rotated, so an offset
+    /// stays meaningful for the life of the session — a cursor cannot silently
+    /// start pointing at different content.
+    pub next_cursor: u64,
+    /// The disk cap was hit: the logs are incomplete by design.
+    pub truncated_log: bool,
+    /// The requested cursor was past the end of the logs (a stale or mistyped
+    /// cursor). Nothing is returned and `next_cursor` resyncs to the real end.
+    pub reset: bool,
+}
+
+/// Current end offset of a session's logs, for callers that want to switch from
+/// `--tail` to cursor mode without missing or repeating anything.
+pub fn log_len(id: &str) -> u64 {
+    let dir = session_dir(id);
+    [dir.join("stdout.log"), dir.join("stderr.log")]
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Everything appended to a session's logs at or after `cursor`.
+///
+/// The agent-facing loop this exists for: `--since 0`, do work, `--since
+/// <next_cursor>`, … instead of re-reading (and re-parsing) the same tail.
+pub fn output_since(id: &str, cursor: u64) -> Result<OutputPage, String> {
+    let st = status(id)?;
+    let dir = session_dir(id);
+    let (stdout, so_next, so_reset) = read_since(&dir.join("stdout.log"), cursor);
+    let (stderr, se_next, se_reset) = read_since(&dir.join("stderr.log"), cursor);
+    Ok(OutputPage {
+        id: id.to_string(),
+        stdout,
+        stderr,
+        // One cursor for both streams: they advance independently, so the
+        // caller-facing value is the furthest either of them reached.
+        next_cursor: so_next.max(se_next),
+        truncated_log: st.truncated_log,
+        reset: so_reset || se_reset,
+    })
+}
+
+/// Read from `cursor` to EOF. Returns `(text, next_cursor, reset)`.
+///
+/// A cursor that lands mid-character (only possible if a caller invents one) is
+/// advanced to the next boundary rather than yielding U+FFFD; a cursor past the
+/// end reports `reset` so the caller knows it missed nothing but lost its place.
+fn read_since(path: &Path, cursor: u64) -> (String, u64, bool) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return (String::new(), cursor, false),
+    };
+    let end = bytes.len() as u64;
+    if cursor > end {
+        return (String::new(), end, true);
+    }
+    let mut start = cursor as usize;
+    // Never split a codepoint.
+    while start < bytes.len() && (bytes[start] & 0xC0) == 0x80 {
+        start += 1;
+    }
+    (
+        String::from_utf8_lossy(&bytes[start..]).into_owned(),
+        end,
+        false,
+    )
+}
+
 /// Kill a running session: SIGTERM the runner (POSIX) / taskkill the tree
 /// (Windows), wait briefly for the runner to record a terminal state, then
 /// force-mark `killed` if it did not.

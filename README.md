@@ -162,7 +162,7 @@ version→feature table:
  "platform":{"os":"macos","arch":"aarch64"},
  "features":["local-exec","probe","mcp","acp","bg-session","recipe-registry",
              "recipe-toolchain","ssh","ssh-identity","ssh-workdir-env",
-             "remote-abort","mcp-cancel","probe-state",
+             "remote-abort","mcp-cancel","probe-state","session-cursor",
              "error-taxonomy","output-cap","truncation-flag","transport-error",
              "dispatched","kill-status","exit-code-confidence","drain-timeout",
              "legacy-codepage","encoding-hint","strict-flags"]}
@@ -215,13 +215,18 @@ session 862718cd5514c7ea4d380 started (pid 12345) — web-build
 $ unirun bg status 862718cd5514c7ea4d380          # running | completed | timed_out | aborted | …
 $ unirun bg wait 862718cd5514c7ea4d380 --timeout 300 --json
 $ unirun bg output 862718cd5514c7ea4d380 --tail 65536
+$ unirun bg output 862718cd5514c7ea4d380 --since 0            # then --since <next_cursor>
 $ unirun bg kill 862718cd5514c7ea4d380
 $ unirun bg list
 ```
 
 Sessions live in `$UNIRUN_HOME/sessions` (default `~/.unirun/sessions`),
 survive the launching CLI, and stream decoded output to `stdout.log` /
-`stderr.log` (1 MiB cap, flagged `truncated_log`). The same API is exposed
+`stderr.log` (1 MiB cap, flagged `truncated_log`). Logs are append-only and
+never rotated, so `--since <cursor>` is stable: the JSON result carries
+`next_cursor`, and the next call returns only what was appended after it
+(`reset: true` says a stale cursor was resynced). MCP `session.output` takes the
+same `cursor`. The same API is exposed
 as MCP `session.*` tools. Exit-code contract for `bg wait` mirrors the CLI:
 completed rc mirrors the child, timed out 124, aborted/killed 130.
 

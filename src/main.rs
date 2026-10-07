@@ -137,6 +137,8 @@ struct CliOpts {
     toolchain: Option<String>,
     label: Option<String>,
     tail_bytes: Option<usize>,
+    /// `--since N`: return only what was appended after byte offset N.
+    since: Option<u64>,
     /// Per-stream output cap in bytes (`--max-output`); applies to local,
     /// SSH and WinRM runs alike. `None`/`0` → the shared default (256 KiB).
     max_output_bytes: Option<usize>,
@@ -258,6 +260,14 @@ fn parse_flags(raw_args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, S
                 i += 1;
                 let v = args.get(i).ok_or("--tail needs a value")?;
                 opts.tail_bytes = Some(v.parse().map_err(|_| "invalid --tail (byte count)")?);
+            }
+            "--since" => {
+                i += 1;
+                let v = args.get(i).ok_or("--since needs a cursor")?;
+                opts.since = Some(
+                    v.parse()
+                        .map_err(|_| "invalid --since (byte cursor from next_cursor)")?,
+                );
             }
             "--max-output" => {
                 i += 1;
@@ -751,7 +761,7 @@ unirun bg — background sessions (detached execution agents can poll)
 USAGE:
   unirun bg start '<command>' [--shell s] [--workdir d] [--env K=V] [--timeout N] [--label L] [--json]
   unirun bg status <id> [--json]
-  unirun bg output <id> [--tail N] [--json]
+  unirun bg output <id> [--tail N | --since CURSOR] [--json]
   unirun bg kill <id> [--json]
   unirun bg wait <id> [--timeout N] [--json]
   unirun bg list [--json]
@@ -846,27 +856,48 @@ fn cmd_bg(args: &[String]) -> ExitCode {
                 },
                 "output" => match id {
                     Some(id) => {
-                        let tail = opts.tail_bytes.unwrap_or(65_536);
-                        match sess::output(id, tail) {
-                            Ok((so, se, truncated_log)) => {
+                        // `--since <cursor>` reads incrementally; without it the
+                        // old `--tail` behaviour is kept, and the JSON carries a
+                        // `next_cursor` so the caller can switch to cursors.
+                        let page = if let Some(cursor) = opts.since {
+                            sess::output_since(id, cursor)
+                        } else {
+                            let tail = opts.tail_bytes.unwrap_or(65_536);
+                            sess::output(id, tail).map(|(so, se, truncated_log)| {
+                                sess::OutputPage {
+                                    id: id.to_string(),
+                                    stdout: so,
+                                    stderr: se,
+                                    // From here on the caller has a cursor: keep
+                                    // the position the tail read ended at.
+                                    next_cursor: sess::log_len(id),
+                                    truncated_log,
+                                    reset: false,
+                                }
+                            })
+                        };
+                        match page {
+                            Ok(page) => {
                                 if opts.json {
                                     println!(
                                         "{}",
-                                        serde_json::json!({
-                                            "id": id,
-                                            "stdout": so,
-                                            "stderr": se,
-                                            "truncated_log": truncated_log,
-                                        })
+                                        serde_json::to_string(&page)
+                                            .unwrap_or_else(|_| "{}".into())
                                     );
                                 } else {
-                                    print!("{}", so);
-                                    if !se.is_empty() {
+                                    print!("{}", page.stdout);
+                                    if !page.stderr.is_empty() {
                                         println!("--- stderr ---");
-                                        print!("{}", se);
+                                        print!("{}", page.stderr);
                                     }
-                                    if truncated_log {
-                                        eprintln!("(log truncated at {} bytes)", tail);
+                                    if page.reset {
+                                        eprintln!(
+                                            "(cursor was past the end; next_cursor = {})",
+                                            page.next_cursor
+                                        );
+                                    }
+                                    if page.truncated_log {
+                                        eprintln!("(log capped at {} bytes)", page.next_cursor);
                                     }
                                 }
                                 ExitCode::SUCCESS

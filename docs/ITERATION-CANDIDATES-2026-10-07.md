@@ -51,7 +51,8 @@
 | A3 MCP 取消 + SIGINT | ✅ 已完成 | MCP server 改为「读线程 + 工作线程 + 写线程」：`tools/call` 各自线程运行并带**每请求** abort 标志，`notifications/cancelled` 真正生效；SIGINT 由读循环轮询处理并映射 130；新增能力键 `mcp-cancel`；`tests/mcp.rs` 两个 E2E（取消 200ms 内返回 ABORTED、SIGINT 退出码 130） |
 | A12 `PLATFORM-DIFFS.md` | ✅ 已完成 | 新增 `docs/PLATFORM-DIFFS.md`：21 条平台事实 + 各自的证据出处与**测试名**（36 个引用，逐一核对存在；2 个 `[win]` 标注为仅 Windows 编译）；为原先无覆盖的 5 条补了测试（WSL shim 判定、Windows 扩展名解析、PS 配方 try/catch、payload base64/BOM、cmd 退出契约、probe 平台来源） |
 | A8 probe 三态 | ✅ 已完成 | `ProbeState::{Found,Absent,Unreadable}` + 每项 `state` + `Capabilities.unreadable` 覆盖率列表；`which_state`/`scan_dirs`/`scan_one`（纯函数，用 chmod 000 目录验证 unreadable 分支）；probe 人读输出显示 `(absent)`/`(unreadable)`；能力键 `probe-state` |
-| A6–A7（远端会话 / bg 游标） | ⏳ 待办 | |
+| A7 bg 增量游标 | ✅ 已完成 | `session::output_since` + `OutputPage{next_cursor,reset,truncated_log}`；CLI `bg output --since N`、MCP `session.output` 的 `cursor` 参数；日志 append-only 不轮转 ⇒ 偏移稳定；能力键 `session-cursor`；含「不重复/不丢字符/陈旧游标 reset」集成测试 |
+| A6 远端会话（`ssh --detach`） | ⏳ 待办 | |
 | A9 + 0.5.0 发布 | ⏳ 待办 | |
 
 ## 1. 口径：什么算「本项目范畴」

@@ -309,10 +309,11 @@ fn session_status_tool() -> Value {
 fn session_output_tool() -> Value {
     tool_schema(
         "session.output",
-        "Return the stdout/stderr log tails of a background session.",
+        "Return background-session output: a byte tail, or only what is new since a cursor (pass a previous `next_cursor` as `cursor`).",
         json!({
             "id": { "type": "string", "description": "session id from session.start" },
-            "tail": { "type": "number", "description": "max bytes per stream to return (default 65536)" }
+            "tail": { "type": "number", "description": "max bytes per stream to return (default 65536)" },
+            "cursor": { "type": "number", "description": "return only output appended after this cursor (from a previous next_cursor); overrides tail" }
         }),
         &["id"],
     )
@@ -479,19 +480,29 @@ fn call_tool(name: &str, args: &Value, cancel: &AtomicBool) -> (String, bool) {
                     true,
                 );
             }
-            let tail = args
-                .get("tail")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(65_536.0) as usize;
-            match crate::session::output(&id, tail) {
-                Ok((so, se, truncated_log)) => (
-                    serde_json::to_string(&json!({
-                        "id": id,
-                        "stdout": so,
-                        "stderr": se,
-                        "truncated_log": truncated_log,
-                    }))
-                    .unwrap_or_else(|_| "{}".into()),
+            // `cursor` reads incrementally from a previous `next_cursor`;
+            // without it, the `tail` behaviour is kept for compatibility.
+            let page = if let Some(cursor) = args.get("cursor").and_then(|v| v.as_u64()) {
+                crate::session::output_since(&id, cursor)
+            } else {
+                let tail = args
+                    .get("tail")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(65_536.0) as usize;
+                crate::session::output(&id, tail).map(|(so, se, truncated_log)| {
+                    crate::session::OutputPage {
+                        id: id.clone(),
+                        stdout: so,
+                        stderr: se,
+                        next_cursor: crate::session::log_len(&id),
+                        truncated_log,
+                        reset: false,
+                    }
+                })
+            };
+            match page {
+                Ok(page) => (
+                    serde_json::to_string(&page).unwrap_or_else(|_| "{}".into()),
                     false,
                 ),
                 Err(e) => (json_error(&e), true),
