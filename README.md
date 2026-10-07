@@ -132,6 +132,12 @@ unirun bg <start|status|output|kill|wait|list> ...   # background sessions
 unirun recipe <list|show|add|rm|path|effective|check> # recipe registry
 ```
 
+Argument contract: `--flag value` and `--flag=value` are both accepted, and an
+unknown `--flag` is a **usage error (exit 2)** — it is never appended to the
+command or to the remote script. Use `--` when an argument to the command
+starts with a dash (`unirun run 'echo' --json -- --not-a-flag`); single-dash
+tokens like `-la` are positional, since they belong to the command.
+
 ### MCP — plug into any agent
 
 `unirun mcp` is a stdio MCP server exposing `exec.run`, `exec.script`,

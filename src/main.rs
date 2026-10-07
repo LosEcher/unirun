@@ -49,6 +49,11 @@ OPTIONS:
   --identity <file>  SSH identity file for `unirun ssh` (-i)
   --json             emit the normalized result as JSON (agent mode)
   --pretty           pretty-print JSON (implies --json)
+  --                 end of flags: everything after it is positional (use this
+                      when an argument to the command starts with `--`)
+  --flag=value       `--flag value` and `--flag=value` are both accepted;
+                      unknown `--flags` are a usage error (exit 2), never
+                      appended to the command
 
 Projects may ship a `.unirun/recipe.toml`; run/script auto-apply its
 timeout and output conventions, and `--toolchain` resolves its runners.
@@ -134,13 +139,52 @@ struct CliOpts {
     identity: Option<PathBuf>,
 }
 
+/// Split `--flag=value` into `--flag value`, so both spellings work.
+fn expand_equals(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        if a.starts_with("--") {
+            if let Some((flag, value)) = a.split_once('=') {
+                out.push(flag.to_string());
+                out.push(value.to_string());
+                continue;
+            }
+        }
+        out.push(a.clone());
+    }
+    out
+}
+
+/// Reject an unknown `--long` flag instead of pushing it into the positional
+/// list.
+///
+/// This used to be `_ => positional.push(a.clone())`, and the positionals are
+/// joined back into the command (`run`) or the remote script (`ssh`), so a
+/// typo like `--cwd /srv` was silently *appended to the script that ran*
+/// (los/packages/gateway/src/unirun-capabilities.ts:1-6 exists because of
+/// that). Single-dash tokens stay positional: `-la` is an argument to the
+/// command, not a unirun flag.
+fn unknown_flag_error(flag: &str) -> String {
+    format!(
+        "unknown flag `{}` (put `--` before positional arguments that start with a dash)",
+        flag
+    )
+}
+
 /// Parse `--flag value` pairs; positional args are returned in order.
-fn parse_flags(args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, String> {
+fn parse_flags(raw_args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, String> {
+    let expanded = expand_equals(raw_args);
+    let args: &[String] = &expanded;
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
         match a.as_str() {
+            // Everything after `--` is positional, even if it looks like a flag.
+            "--" => {
+                positional.extend_from_slice(&args[i + 1..]);
+                break;
+            }
             "--json" => opts.json = true,
             "--pretty" => {
                 opts.json = true;
@@ -213,7 +257,12 @@ fn parse_flags(args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, Strin
                 let v = args.get(i).ok_or("--output-encoding needs a value")?;
                 opts.output_encoding = Some(validate_output_encoding(v)?);
             }
-            _ => positional.push(a.clone()),
+            _ => {
+                if a.starts_with("--") {
+                    return Err(unknown_flag_error(a));
+                }
+                positional.push(a.clone());
+            }
         }
         i += 1;
     }
@@ -446,6 +495,13 @@ fn cmd_ssh(args: &[String]) -> ExitCode {
 }
 
 fn cmd_probe(args: &[String]) -> ExitCode {
+    // `probe` takes no positionals; anything unknown is a mistake, not input.
+    for a in args {
+        if !matches!(a.as_str(), "--json" | "--pretty") {
+            eprintln!("unirun probe: {}", unknown_flag_error(a));
+            return ExitCode::from(2);
+        }
+    }
     let json = args.iter().any(|a| a == "--json" || a == "--pretty");
     let caps = unirun::probe();
     if json {
@@ -890,6 +946,8 @@ fn cmd_winrm(args: &[String]) -> ExitCode {
     let mut json = false;
     let mut pretty = false;
     let mut positional: Vec<String> = Vec::new();
+    let expanded = expand_equals(args);
+    let args: &[String] = &expanded;
     let mut i = 0;
     let fail = |msg: &str| -> ExitCode {
         eprintln!("unirun winrm: {}", msg);
@@ -902,6 +960,10 @@ fn cmd_winrm(args: &[String]) -> ExitCode {
             args.get(*i)
         };
         match a.as_str() {
+            "--" => {
+                positional.extend_from_slice(&args[i + 1..]);
+                break;
+            }
             "--json" => json = true,
             "--pretty" => {
                 json = true;
@@ -937,7 +999,12 @@ fn cmd_winrm(args: &[String]) -> ExitCode {
                 Some(m) => target.max_output_bytes = m,
                 None => return fail("--max-output needs a byte count"),
             },
-            other => positional.push(other.to_string()),
+            other => {
+                if other.starts_with("--") {
+                    return fail(&unknown_flag_error(other));
+                }
+                positional.push(other.to_string());
+            }
         }
         i += 1;
     }

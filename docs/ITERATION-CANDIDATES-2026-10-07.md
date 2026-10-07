@@ -39,7 +39,7 @@
 |---|---|---|
 | A0 远程截断标志 + 可配上限 | ✅ 已完成 | `src/transport.rs` 的 `assemble_ssh_result`/`output_cap`、`src/winrm.rs` 的 `tail_keep`、CLI `--max-output`；单测 5 条 + 本地 E2E（`seq 1 200000 --max-output 1024` → `truncated:true` + 保尾 1024B） |
 | A14 `B64_THRESHOLD` | ✅ 已完成 | 60 000 → 30 000，新增 `inline_encoded_command_fits` 与 `CREATEPROCESS_COMMAND_LINE_LIMIT` 不变量测试 |
-| A15 代码页解码 | ⏳ 待办 | |
+| A15 代码页解码 | ✅ 已完成 | GBK 自动回退 + `--output-encoding`/recipe `[conventions] encoding`（此前该字段解析了但从未生效）+ CP437/CP850/CP1252/Big5 显式提示；15 单测 + 4 CLI 集成测试；dist 二进制 +165 KB（已记录在 Cargo.toml） |
 | A1 未知 flag fail-closed | ⏳ 待办 | |
 | A16 `transport_error` | ⏳ 待办 | |
 | A13 `dispatched` | ⏳ 待办 | |
