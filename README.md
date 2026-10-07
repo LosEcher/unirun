@@ -154,7 +154,7 @@ version→feature table:
  "platform":{"os":"macos","arch":"aarch64"},
  "features":["local-exec","probe","mcp","acp","bg-session","recipe-registry",
              "recipe-toolchain","ssh","ssh-identity","ssh-workdir-env",
-             "remote-abort",
+             "remote-abort","mcp-cancel",
              "error-taxonomy","output-cap","truncation-flag","transport-error",
              "dispatched","kill-status","exit-code-confidence","drain-timeout",
              "legacy-codepage","encoding-hint","strict-flags"]}
@@ -170,7 +170,10 @@ precedent behaviour rather than assume the capability is absent.
 `exec.probe` and the background-session tools `session.start`, `session.status`,
 `session.output`, `session.kill`, `session.wait`, `session.list`
 (JSON-RPC 2.0, newline-delimited). `exec.capabilities` reports what the build
-can do, same payload as `unirun capabilities --json`.
+can do, same payload as `unirun capabilities --json`. Calls run on their own
+threads, so `notifications/cancelled` really stops a running `exec.run`
+(per-request abort flag; the other calls are unaffected) and Ctrl-C shuts the
+server down with the usual 130.
 Point any MCP-capable agent at it:
 
 ```json

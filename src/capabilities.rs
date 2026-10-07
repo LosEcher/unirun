@@ -31,6 +31,7 @@ pub const FEATURE_KEYS: &[&str] = &[
     "local-exec",
     "probe",
     "mcp",
+    "mcp-cancel", // notifications/cancelled stops a running exec.*
     "acp",
     "bg-session",
     "recipe-registry",

@@ -101,14 +101,24 @@ fn main() -> ExitCode {
                 eprintln!("unirun mcp: {}", e);
                 return ExitCode::from(1);
             }
-            ExitCode::SUCCESS
+            // Ctrl-C reaches the server as an abort; mirror the CLI contract
+            // (130) instead of reporting a clean exit.
+            if unirun::exec::abort_requested() {
+                ExitCode::from(130)
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         "acp" => {
             if let Err(e) = unirun::acp::serve() {
                 eprintln!("unirun acp: {}", e);
                 return ExitCode::from(1);
             }
-            ExitCode::SUCCESS
+            if unirun::exec::abort_requested() {
+                ExitCode::from(130)
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         other => {
             eprintln!("unirun: unknown subcommand `{}`", other);

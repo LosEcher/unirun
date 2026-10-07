@@ -48,7 +48,7 @@
 | A5 `kill_status`/`exit_code_confidence` | ✅ 已完成 | 四态 `kill_status` + `exit_code_confidence` + taxonomy `PROCESS_UNKILLABLE`（"存活"优先于 TIMEOUT）；cmd 分支补 `exit /b %ERRORLEVEL%` 契约；真实「忽略 SIGTERM → sigkill-escalated」用例 + 状态机/置信度单测；E2E `trap '' TERM; sleep 30` 验证 |
 | A4 有界 drain | ✅ 已完成 | 每流 `PartialCapture` + 单次共享 drain 预算（默认 2s，`ExecSpec.drain_ms`），新增 `drain_timeout` 字段与 `drain-timeout` 能力键；本地与 ssh 两路都覆盖；真实「孙进程持有管道」用例（`sleep 5 &` 2.0s 返回而非 5s/永久） |
 | A2 远程 abort | ✅ 已完成 | `remote_stop()`（abort 优先于 deadline）接入 ssh 等待循环与 winrm 轮询（PSRP 无取消钩子 ⇒ 放弃 runspace 并如实标注）；新增能力键 `remote-abort`；单测 + 需真机的 ignored E2E（SIGINT → aborted/rc130） |
-| A3 MCP 取消 + SIGINT | ⏳ 待办 | |
+| A3 MCP 取消 + SIGINT | ✅ 已完成 | MCP server 改为「读线程 + 工作线程 + 写线程」：`tools/call` 各自线程运行并带**每请求** abort 标志，`notifications/cancelled` 真正生效；SIGINT 由读循环轮询处理并映射 130；新增能力键 `mcp-cancel`；`tests/mcp.rs` 两个 E2E（取消 200ms 内返回 ABORTED、SIGINT 退出码 130） |
 | A6–A8、A12（会话/探测/平台差异） | ⏳ 待办 | |
 | A9 + 0.5.0 发布 | ⏳ 待办 | |
 

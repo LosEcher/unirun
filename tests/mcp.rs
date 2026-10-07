@@ -327,3 +327,81 @@ fn mcp_session_start_wait_output() {
     std::env::remove_var("UNIRUN_BIN");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The cancellation notification must actually stop a running call. Before
+/// this, `notifications/cancelled` was a no-op and the call ran to completion —
+/// an agent that cancels a long command got nothing back until it finished.
+#[test]
+fn mcp_cancelled_call_reports_aborted() {
+    let mut s = McpSession::start();
+    s.request_ok("initialize", serde_json::json!({}));
+    let id = s.next_id;
+    s.next_id += 1;
+    writeln!(
+        s.stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": "exec.run", "arguments": { "command": "sleep 5" } }
+        })
+    )
+    .unwrap();
+    s.stdin.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    writeln!(
+        s.stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": id }
+        })
+    )
+    .unwrap();
+    s.stdin.flush().unwrap();
+
+    let started = std::time::Instant::now();
+    let mut line = String::new();
+    s.reader.read_line(&mut line).unwrap();
+    let elapsed = started.elapsed();
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["id"], serde_json::json!(id), "{}", v);
+    let text = v["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["aborted"], serde_json::json!(true), "{}", parsed);
+    assert_eq!(parsed["error_class"], serde_json::json!("ABORTED"));
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the cancel must take effect promptly, not after the command: {elapsed:?}"
+    );
+    s.close();
+}
+
+/// Ctrl-C must stop the server. The installed SIGINT handler used to swallow
+/// it: the process stayed alive with the flag set and nobody reading it.
+#[cfg(unix)]
+#[test]
+fn mcp_server_exits_on_sigint() {
+    let mut s = McpSession::start();
+    s.request_ok("initialize", serde_json::json!({}));
+    // SAFETY: signalling a child we started.
+    unsafe { libc::kill(s.child.id() as i32, libc::SIGINT) };
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = s.child.try_wait().unwrap() {
+            assert_eq!(
+                status.code(),
+                Some(130),
+                "SIGINT must map to the abort exit code"
+            );
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the MCP server ignored SIGINT"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}

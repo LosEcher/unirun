@@ -1,110 +1,225 @@
 //! MCP (Model Context Protocol) server — stdio transport.
 //!
 //! Minimal, dependency-free implementation of the MCP 2024-11-05 tool
-//! surface: `exec.run`, `exec.script`, `exec.probe`. Newline-delimited
-//! JSON-RPC 2.0 over stdin/stdout — the standard every MCP-capable agent
-//! (Claude Code, Cursor, DSH, …) speaks. `unirun mcp` is a long-lived
-//! stdio process; run it once per agent session.
+//! surface: `exec.run`, `exec.script`, `exec.probe`, `exec.capabilities` and
+//! the `session.*` background tools. Newline-delimited JSON-RPC 2.0 over
+//! stdin/stdout — the standard every MCP-capable agent (Claude Code, Cursor,
+//! DSH, …) speaks. `unirun mcp` is a long-lived stdio process; run it once per
+//! agent session.
+//!
+//! Concurrency: `tools/call` runs on its own thread so the reader keeps
+//! draining stdin. That is what makes `notifications/cancelled` real — a
+//! synchronous server cannot see the cancellation until the call it wants to
+//! cancel has already finished (the previous implementation no-op'd the
+//! notification, so a cancelled `exec.run` ran to completion). Cancellation is
+//! per request: each call carries its own abort flag, so cancelling one call
+//! does not disturb another.
+//!
+//! SIGINT is honoured too: the reader polls the process-wide abort flag, so
+//! Ctrl-C stops the server instead of being swallowed by the installed handler
+//! (measured before this change: the process stayed alive).
 
 use crate::probe;
 use crate::spec::{ExecKind, ExecResult, ExecSpec, Shell};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::Duration;
 
-/// Serve the MCP protocol until stdin closes.
+/// How often the reader wakes up to notice a SIGINT.
+const ABORT_POLL: Duration = Duration::from_millis(100);
+
+/// One in-flight `tools/call`.
+struct InFlight {
+    /// The JSON-RPC request id, as sent (echoed in `notifications/cancelled`).
+    request_id: Value,
+    cancel: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// Serve the MCP protocol until stdin closes (or SIGINT).
 pub fn serve() -> std::io::Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
+    // Reader thread: stdin → channel. All JSON parsing happens on the main
+    // loop so a malformed line cannot desynchronise the stream.
+    let (line_tx, line_rx) = mpsc::channel::<Option<Value>>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Value>(&line) {
+                Ok(v) => {
+                    if line_tx.send(Some(v)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => continue,
+            }
         }
-        let msg: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let method = msg.get("method").and_then(|m| m.as_str());
-        let id = msg.get("id").cloned();
-        match method {
-            Some("initialize") => {
-                let result = json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "unirun", "version": env!("CARGO_PKG_VERSION") }
-                });
-                respond(&mut stdout, id, Ok(result))?;
+        let _ = line_tx.send(None);
+    });
+
+    // Writer thread: responses arrive from worker threads and are written one
+    // line at a time, so two calls can never interleave inside a message.
+    let (out_tx, out_rx) = mpsc::channel::<String>();
+    let writer = std::thread::spawn(move || {
+        let stdout = std::io::stdout();
+        for line in out_rx {
+            let mut lock = stdout.lock();
+            if writeln!(lock, "{}", line).is_err() {
+                break;
             }
-            Some("notifications/initialized") | Some("notifications/cancelled") => {
-                // Notifications get no reply.
+            let _ = lock.flush();
+        }
+    });
+
+    let mut inflight: Vec<InFlight> = Vec::new();
+    loop {
+        match line_rx.recv_timeout(ABORT_POLL) {
+            Ok(Some(msg)) => {
+                handle_message(&msg, &out_tx, &mut inflight);
             }
-            Some("ping") => {
-                respond(&mut stdout, id, Ok(json!({})))?;
-            }
-            Some("tools/list") => {
-                let tools = json!([
-                    exec_run_tool(),
-                    exec_script_tool(),
-                    exec_probe_tool(),
-                    exec_capabilities_tool(),
-                    session_start_tool(),
-                    session_status_tool(),
-                    session_output_tool(),
-                    session_kill_tool(),
-                    session_list_tool(),
-                    session_wait_tool()
-                ]);
-                respond(&mut stdout, id, Ok(json!({ "tools": tools })))?;
-            }
-            Some("tools/call") => {
-                let name = msg
-                    .pointer("/params/name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let args = msg
-                    .pointer("/params/arguments")
-                    .cloned()
-                    .unwrap_or(json!({}));
-                let (text, is_error) = call_tool(name, &args);
-                respond(
-                    &mut stdout,
-                    id,
-                    Ok(json!({
-                        "content": [{ "type": "text", "text": text }],
-                        "isError": is_error
-                    })),
-                )?;
-            }
-            _ => {
-                if let Some(id) = id {
-                    respond(
-                        &mut stdout,
-                        Some(id),
-                        Err(json!({
-                            "code": -32601,
-                            "message": format!("method not found: {}", method.unwrap_or("?"))
-                        })),
-                    )?;
+            Ok(None) => break, // stdin closed
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if crate::exec::abort_requested() {
+                    // Ctrl-C: cancel what is running and let the workers unwind.
+                    for req in &inflight {
+                        req.cancel.store(true, Ordering::SeqCst);
+                    }
+                    break;
                 }
             }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+
+    // Cancel anything still running, then give the workers a moment to report.
+    for req in &inflight {
+        req.cancel.store(true, Ordering::SeqCst);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_millis(1_000);
+    while inflight.iter().any(|r| !r.handle.is_finished()) {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        inflight.retain(|r| !r.handle.is_finished());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(out_tx);
+    let _ = writer.join();
     Ok(())
 }
 
-fn respond(
-    w: &mut impl Write,
-    id: Option<Value>,
-    result: Result<Value, Value>,
-) -> std::io::Result<()> {
-    let msg = match (id, result) {
+fn handle_message(msg: &Value, out: &mpsc::Sender<String>, inflight: &mut Vec<InFlight>) {
+    inflight.retain(|r| !r.handle.is_finished());
+    let method = msg.get("method").and_then(|m| m.as_str());
+    let id = msg.get("id").cloned();
+    match method {
+        Some("initialize") => {
+            let result = json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "unirun", "version": env!("CARGO_PKG_VERSION") }
+            });
+            send(out, response(id, Ok(result)));
+        }
+        Some("notifications/initialized") => {}
+        Some("notifications/cancelled") => {
+            // Per MCP: params.requestId identifies the call to cancel. An id we
+            // do not know is ignored (the call already finished).
+            let target = msg.pointer("/params/requestId").cloned();
+            if let Some(target) = target {
+                for req in inflight.iter() {
+                    if req.request_id == target {
+                        req.cancel.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+        Some("ping") => send(out, response(id, Ok(json!({})))),
+        Some("tools/list") => {
+            let tools = json!([
+                exec_run_tool(),
+                exec_script_tool(),
+                exec_probe_tool(),
+                exec_capabilities_tool(),
+                session_start_tool(),
+                session_status_tool(),
+                session_output_tool(),
+                session_kill_tool(),
+                session_list_tool(),
+                session_wait_tool()
+            ]);
+            send(out, response(id, Ok(json!({ "tools": tools }))));
+        }
+        Some("tools/call") => {
+            let name = msg
+                .pointer("/params/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args = msg
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or(json!({}));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker_cancel = cancel.clone();
+            let out = out.clone();
+            let handle = std::thread::spawn(move || {
+                let (text, is_error) = call_tool(&name, &args, &worker_cancel);
+                send(
+                    &out,
+                    response(
+                        id,
+                        Ok(json!({
+                            "content": [{ "type": "text", "text": text }],
+                            "isError": is_error
+                        })),
+                    ),
+                );
+            });
+            inflight.push(InFlight {
+                request_id: msg.get("id").cloned().unwrap_or(Value::Null),
+                cancel,
+                handle,
+            });
+        }
+        _ => {
+            send(
+                out,
+                response(
+                    id,
+                    Err(json!({
+                        "code": -32601,
+                        "message": format!("method not found: {}", method.unwrap_or("?"))
+                    })),
+                ),
+            );
+        }
+    }
+}
+
+fn send(out: &mpsc::Sender<String>, msg: Value) {
+    if msg.is_null() {
+        // A notification gets no reply.
+        return;
+    }
+    if let Ok(s) = serde_json::to_string(&msg) {
+        let _ = out.send(s);
+    }
+}
+
+fn response(id: Option<Value>, result: Result<Value, Value>) -> Value {
+    match (id, result) {
         (Some(id), Ok(r)) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
         (Some(id), Err(e)) => json!({ "jsonrpc": "2.0", "id": id, "error": e }),
-        (None, _) => return Ok(()),
-    };
-    let s = serde_json::to_string(&msg)?;
-    writeln!(w, "{}", s)?;
-    w.flush()
+        // A notification gets no reply.
+        (None, _) => Value::Null,
+    }
 }
 
 fn tool_schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
@@ -233,7 +348,9 @@ fn session_wait_tool() -> Value {
     )
 }
 
-fn call_tool(name: &str, args: &Value) -> (String, bool) {
+/// Run one tool call. `cancel` is this call's own abort flag: `exec.run` and
+/// `exec.script` honour it, everything else is short-lived by construction.
+fn call_tool(name: &str, args: &Value, cancel: &AtomicBool) -> (String, bool) {
     let result = match name {
         "exec.run" => {
             let command = args
@@ -247,10 +364,13 @@ fn call_tool(name: &str, args: &Value) -> (String, bool) {
                     true,
                 );
             }
-            unirun_run(&ExecSpec {
-                command,
-                ..spec_from_args(args)
-            })
+            unirun_run_cancellable(
+                &ExecSpec {
+                    command,
+                    ..spec_from_args(args)
+                },
+                cancel,
+            )
         }
         "exec.script" => {
             let script = args
@@ -269,7 +389,7 @@ fn call_tool(name: &str, args: &Value) -> (String, bool) {
                 kind: ExecKind::Script,
                 ..spec_from_args(args)
             };
-            unirun_run(&spec)
+            unirun_run_cancellable(&spec, cancel)
         }
         "exec.probe" => {
             let caps = probe::probe();
@@ -430,8 +550,14 @@ fn spec_from_args(args: &Value) -> ExecSpec {
     spec
 }
 
-fn unirun_run(spec: &ExecSpec) -> (String, bool) {
-    let result = crate::exec::run(spec);
+/// `exec.run`/`exec.script` with a caller-owned abort flag, so
+/// `notifications/cancelled` can stop one call without touching another.
+fn unirun_run_cancellable(spec: &ExecSpec, cancel: &AtomicBool) -> (String, bool) {
+    let result = crate::exec::run_with_abort_streaming(spec, cancel, None);
+    tool_result(result)
+}
+
+fn tool_result(result: ExecResult) -> (String, bool) {
     let is_error = result.error_class.is_some() || result.timed_out || result.aborted;
     (
         serde_json::to_string(&result).unwrap_or_else(|_| "{}".into()),
