@@ -52,6 +52,38 @@ pub fn signal_abort() {
     ABORT.store(true, Ordering::SeqCst);
 }
 
+/// Has the caller asked to cancel? Consulted by every transport's wait loop,
+/// not just the local one: a Ctrl-C during a remote run must cancel it too.
+pub fn abort_requested() -> bool {
+    ABORT.load(Ordering::SeqCst)
+}
+
+/// Why a wait loop stopped, when it did not stop because the child exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteStop {
+    Aborted,
+    TimedOut,
+}
+
+/// Which reason wins when both are true.
+///
+/// Cancellation is checked **before** the deadline: a Ctrl-C that lands at the
+/// same moment as the timeout is a caller cancellation, and reporting `TIMEOUT`
+/// there would invite a retry the caller explicitly did not ask for.
+pub fn remote_stop(
+    abort_requested: bool,
+    elapsed: Duration,
+    timeout: Duration,
+) -> Option<RemoteStop> {
+    if abort_requested {
+        return Some(RemoteStop::Aborted);
+    }
+    if elapsed >= timeout {
+        return Some(RemoteStop::TimedOut);
+    }
+    None
+}
+
 /// Which stream a chunk came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
@@ -836,6 +868,28 @@ mod tests {
             shell: Some(Shell::Bash),
             ..Default::default()
         }
+    }
+
+    /// Cancellation beats the deadline, in every transport's wait loop: a
+    /// Ctrl-C landing at the same instant as the timeout is a caller
+    /// cancellation, not something to invite a retry with `TIMEOUT`.
+    #[test]
+    fn abort_outranks_the_deadline() {
+        let timeout = Duration::from_millis(1_000);
+        assert_eq!(remote_stop(false, Duration::from_millis(10), timeout), None);
+        assert_eq!(
+            remote_stop(false, timeout, timeout),
+            Some(RemoteStop::TimedOut)
+        );
+        assert_eq!(
+            remote_stop(true, Duration::from_millis(10), timeout),
+            Some(RemoteStop::Aborted)
+        );
+        assert_eq!(
+            remote_stop(true, timeout, timeout),
+            Some(RemoteStop::Aborted),
+            "abort must win at the deadline"
+        );
     }
 
     /// The bug this bounds: a grandchild inherits the pipe, the shell exits, and

@@ -202,3 +202,33 @@ fn ssh_unix_timeout_kills_tree() {
     assert!(r.timed_out, "expected timeout, got: {:?}", r.exit_code);
     assert!(!r.stdout.contains("never"));
 }
+
+/// Ctrl-C during a remote run must cancel it: the ssh client's tree is
+/// signalled, the result reports `aborted`, and the CLI exits 130.
+///
+/// `#[ignore]` because it needs a reachable host — run it with
+/// `UNIRUN_TEST_SSH_HOST=<host> cargo test -- --ignored`.
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn ssh_abort_cancels_the_remote_run() {
+    let host = std::env::var("UNIRUN_TEST_SSH_HOST").unwrap_or_else(|_| "win-los".into());
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_unirun"))
+        .args(["ssh", &host, "sleep 60", "--shell", "bash", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn unirun ssh");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    // SAFETY: signalling a child we own.
+    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    let out = child.wait_with_output().expect("wait for unirun ssh");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("normalized JSON result");
+    assert_eq!(parsed["aborted"], serde_json::json!(true), "{parsed}");
+    assert_eq!(parsed["error_class"], serde_json::json!("ABORTED"));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "json mode exits 0 when unirun ran"
+    );
+}

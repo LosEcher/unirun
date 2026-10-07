@@ -124,8 +124,44 @@ pub fn winrm_run(target: &WinrmTarget, script: &str) -> ExecResult {
         script.trim_end(),
         EXIT_SENTINEL
     );
-    let pipeline = Pipeline::new(&full);
-    let result = run_pipeline(&client, &target.host, pipeline);
+    // PSRP's blocking API has no cancellation hook, so the pipeline runs on its
+    // own thread while this one keeps the abort contract: Ctrl-C returns
+    // `aborted: true` and abandons the runspace. The remote side may still be
+    // executing — said plainly in the hint rather than hidden.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let host = target.host.clone();
+    let script_full = full.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_pipeline(&client, &host, Pipeline::new(&script_full)));
+    });
+    let result = loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(r) => break r,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if crate::exec::abort_requested() {
+                    let mut aborted =
+                        ExecResult::success(String::new(), String::new(), "winrm-powershell");
+                    aborted.exit_code = None;
+                    aborted.aborted = true;
+                    aborted.error_class = Some("ABORTED".into());
+                    aborted.hint = Some(
+                        "cancelled by the caller; the PSRP runspace was abandoned and the remote script may still be running"
+                            .into(),
+                    );
+                    aborted.duration_ms = start.elapsed().as_millis() as u64;
+                    return aborted;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return err_result(
+                    "winrm: the pipeline thread stopped without a result".into(),
+                    start,
+                    target,
+                    true,
+                )
+            }
+        }
+    };
 
     let mut r = match result {
         Ok(pr) => {

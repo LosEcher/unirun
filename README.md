@@ -52,7 +52,10 @@ unirun makes this matrix a solved, tested, shared problem:
   stream and uniform across local, SSH and WinRM runs (`--max-output N`,
   default 256 KiB).
 - **SIGINT = abort** — an in-flight process tree is terminated and the result
-  reports `aborted: true` (agent-safe retry).
+  reports `aborted: true` (agent-safe retry). This covers the remote paths too:
+  a Ctrl-C during `ssh` signals the ssh client's tree, and during `winrm` the
+  runspace is abandoned and reported as such (PSRP has no cancel hook, so the
+  hint says the remote script may still be running).
 - **Output coalescing** — streamed stdout chunks are merged into batches and
   forwarded on a 128 KiB byte threshold or a 100 ms timer (stderr stays
   real-time), cutting downstream forwarding overhead without changing content
@@ -151,6 +154,7 @@ version→feature table:
  "platform":{"os":"macos","arch":"aarch64"},
  "features":["local-exec","probe","mcp","acp","bg-session","recipe-registry",
              "recipe-toolchain","ssh","ssh-identity","ssh-workdir-env",
+             "remote-abort",
              "error-taxonomy","output-cap","truncation-flag","transport-error",
              "dispatched","kill-status","exit-code-confidence","drain-timeout",
              "legacy-codepage","encoding-hint","strict-flags"]}

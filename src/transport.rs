@@ -313,6 +313,7 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) ->
     let grace = Duration::from_millis(2_000);
     let mut exit_code = None;
     let mut timed_out = false;
+    let mut aborted = false;
     let mut kill_status: Option<KillStatus> = None;
     loop {
         match child.try_wait() {
@@ -321,11 +322,27 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) ->
                 break;
             }
             Ok(None) => {
-                if start.elapsed() >= timeout {
-                    timed_out = true;
-                    kill_status = Some(kill_ssh_tree(&mut child, grace));
-                    let _ = child.wait();
-                    break;
+                // Ctrl-C cancels a remote run exactly as it cancels a local one:
+                // the ssh client's tree is signalled, so the remote command does
+                // not keep running behind a returned prompt.
+                match crate::exec::remote_stop(
+                    crate::exec::abort_requested(),
+                    start.elapsed(),
+                    timeout,
+                ) {
+                    Some(crate::exec::RemoteStop::Aborted) => {
+                        aborted = true;
+                        kill_status = Some(kill_ssh_tree(&mut child, grace));
+                        let _ = child.wait();
+                        break;
+                    }
+                    Some(crate::exec::RemoteStop::TimedOut) => {
+                        timed_out = true;
+                        kill_status = Some(kill_ssh_tree(&mut child, grace));
+                        let _ = child.wait();
+                        break;
+                    }
+                    None => {}
                 }
                 thread::sleep(Duration::from_millis(10));
             }
@@ -353,6 +370,7 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) ->
         target,
         exit_code,
         timed_out,
+        aborted,
         kill_status,
         drain_timeout,
         StreamCapture {
@@ -392,6 +410,7 @@ fn assemble_ssh_result(
     target: &SshTarget,
     exit_code: Option<i32>,
     timed_out: bool,
+    aborted: bool,
     kill_status: Option<KillStatus>,
     drain_timeout: bool,
     stdout_capture: StreamCapture,
@@ -428,7 +447,7 @@ fn assemble_ssh_result(
         stdout,
         stderr,
         timed_out,
-        aborted: false,
+        aborted,
         duration_ms,
         error_class: None,
         hint: None,
@@ -786,6 +805,7 @@ mod tests {
             &t,
             Some(0),
             false,
+            false,
             None,
             false,
             capture(b"tail-of-stdout", true),
@@ -799,6 +819,7 @@ mod tests {
         let err_hit = assemble_ssh_result(
             &t,
             Some(0),
+            false,
             false,
             None,
             false,
@@ -818,6 +839,7 @@ mod tests {
             &t,
             None,
             true,
+            false,
             None,
             false,
             capture(b"partial", false),
@@ -840,6 +862,7 @@ mod tests {
         let r = assemble_ssh_result(
             &t,
             Some(255),
+            false,
             false,
             None,
             false,
@@ -866,6 +889,7 @@ mod tests {
             &t,
             Some(255),
             false,
+            false,
             None,
             false,
             capture(b"", false),
@@ -885,6 +909,7 @@ mod tests {
         let r = assemble_ssh_result(
             &t,
             Some(255),
+            false,
             false,
             None,
             false,
@@ -909,6 +934,7 @@ mod tests {
         let mixed = assemble_ssh_result(
             &t,
             Some(255),
+            false,
             false,
             None,
             false,
@@ -936,6 +962,7 @@ mod tests {
             &t,
             Some(255),
             true,
+            false,
             None,
             false,
             capture(b"", false),
@@ -968,6 +995,7 @@ mod tests {
             &t,
             Some(255),
             false,
+            false,
             None,
             false,
             capture(b"", false),
@@ -987,6 +1015,7 @@ mod tests {
             &t,
             Some(255),
             false,
+            false,
             None,
             false,
             capture(b"", false),
@@ -999,6 +1028,7 @@ mod tests {
         let dropped = assemble_ssh_result(
             &t,
             Some(255),
+            false,
             false,
             None,
             false,
@@ -1017,6 +1047,7 @@ mod tests {
             &t,
             Some(255),
             false,
+            false,
             None,
             false,
             capture(b"", false),
@@ -1032,6 +1063,7 @@ mod tests {
         let ok = assemble_ssh_result(
             &t,
             Some(0),
+            false,
             false,
             None,
             false,
