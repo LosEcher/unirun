@@ -70,6 +70,9 @@ pub struct SshTarget {
     /// Per-stream output cap in bytes; `0` → `DEFAULT_MAX_OUTPUT_BYTES`.
     /// Overflow is drained and only the tail is kept, flagged `truncated`.
     pub max_output_bytes: usize,
+    /// Explicit code page for the captured output (`--output-encoding`).
+    /// `None` = auto-detect (see `encoding::decode_with`).
+    pub output_encoding: Option<String>,
 }
 
 impl Default for SshTarget {
@@ -85,6 +88,7 @@ impl Default for SshTarget {
             workdir: None,
             env: Vec::new(),
             max_output_bytes: 0,
+            output_encoding: None,
         }
     }
 }
@@ -364,9 +368,10 @@ fn assemble_ssh_result(
     stderr_capture: StreamCapture,
     duration_ms: u64,
 ) -> ExecResult {
-    let stdout_decoded = crate::encoding::decode(&stdout_capture.bytes);
+    let hint = target.output_encoding.as_deref();
+    let stdout_decoded = crate::encoding::decode_with(&stdout_capture.bytes, hint);
     let stderr_raw = filter_banner(&stderr_capture.bytes);
-    let stderr_decoded = crate::encoding::decode(&stderr_raw);
+    let stderr_decoded = crate::encoding::decode_with(&stderr_raw, hint);
     let stdout = crate::encoding::normalize_line_endings(&stdout_decoded.text);
     let stderr = crate::encoding::normalize_line_endings(&stderr_decoded.text);
 
@@ -576,6 +581,7 @@ mod tests {
             workdir: None,
             env: Vec::new(),
             max_output_bytes: 0,
+            output_encoding: None,
         }
     }
 

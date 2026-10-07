@@ -38,6 +38,9 @@ OPTIONS:
   --env K=V          environment override (repeatable)
   --max-output <n>   per-stream output cap in bytes (default 262144); overflow
                       keeps the tail and sets `truncated` (local/SSH/WinRM)
+  --output-encoding <name>
+                     code page for captured output: utf-8 | gbk | big5 | cp437 |
+                      cp850 | windows-1252 (default: auto-detect)
   --toolchain <name> run via a recipe toolchain runner (e.g. python -> uv run)
   --no-coalesce       disable output coalescing (streamed stdout is forwarded
                       in raw chunks instead of merged batches)
@@ -119,6 +122,9 @@ struct CliOpts {
     /// Per-stream output cap in bytes (`--max-output`); applies to local,
     /// SSH and WinRM runs alike. `None`/`0` → the shared default (256 KiB).
     max_output_bytes: Option<usize>,
+    /// Explicit code page for captured output (`--output-encoding`), or
+    /// `utf-8` to switch the auto GBK fallback off.
+    output_encoding: Option<String>,
     no_coalesce: bool,
     json: bool,
     pretty: bool,
@@ -202,11 +208,35 @@ fn parse_flags(args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, Strin
                 opts.max_output_bytes =
                     Some(v.parse().map_err(|_| "invalid --max-output (byte count)")?);
             }
+            "--output-encoding" => {
+                i += 1;
+                let v = args.get(i).ok_or("--output-encoding needs a value")?;
+                opts.output_encoding = Some(validate_output_encoding(v)?);
+            }
             _ => positional.push(a.clone()),
         }
         i += 1;
     }
     Ok(positional)
+}
+
+/// Parse and validate `--output-encoding` / `[conventions] encoding`.
+///
+/// Rejecting unknown names here (rather than ignoring them at decode time)
+/// keeps the contract honest: a typo must not silently fall back to
+/// auto-detection.
+fn validate_output_encoding(name: &str) -> Result<String, String> {
+    let normalized = name.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "utf-8" | "utf8") {
+        return Ok("utf-8".to_string());
+    }
+    match unirun::encoding::LegacyCodePage::from_name(&normalized) {
+        Some(page) => Ok(page.label().to_string()),
+        None => Err(format!(
+            "unknown encoding `{}` (try utf-8, gbk/cp936, big5/cp950, cp437, cp850, windows-1252)",
+            name
+        )),
+    }
 }
 
 fn build_spec(command: String, kind: ExecKind, opts: &CliOpts) -> ExecSpec {
@@ -218,6 +248,7 @@ fn build_spec(command: String, kind: ExecKind, opts: &CliOpts) -> ExecSpec {
         env: opts.env.clone(),
         timeout_ms: opts.timeout_sec.map(|s| s * 1000).unwrap_or(0),
         max_output_bytes: opts.max_output_bytes.unwrap_or(0),
+        output_encoding: opts.output_encoding.clone(),
         coalesce: if opts.no_coalesce {
             CoalescePolicy::Off
         } else {
@@ -240,6 +271,21 @@ fn build_spec(command: String, kind: ExecKind, opts: &CliOpts) -> ExecSpec {
         if spec.max_output_bytes == 0 {
             if let Some(m) = recipe.max_output_bytes() {
                 spec.max_output_bytes = m as usize;
+            }
+        }
+        // The recipe's `[conventions] encoding` was parsed but never applied
+        // before; it is the project-level decode hint now. An explicit
+        // `--output-encoding` still wins, and a bad recipe value is reported
+        // instead of silently ignored.
+        if spec.output_encoding.is_none() {
+            if let Some(name) = recipe.output_encoding() {
+                match validate_output_encoding(&name) {
+                    Ok(normalized) => spec.output_encoding = Some(normalized),
+                    Err(e) => eprintln!(
+                        "unirun: recipe [conventions] encoding: {} — falling back to auto-detect",
+                        e
+                    ),
+                }
             }
         }
         if spec.error_maps.is_empty() {
@@ -385,6 +431,7 @@ fn cmd_ssh(args: &[String]) -> ExitCode {
         workdir: opts.workdir.clone(),
         env: opts.env.clone(),
         max_output_bytes: opts.max_output_bytes.unwrap_or(0),
+        output_encoding: opts.output_encoding.clone(),
         ..Default::default()
     };
     if let Some(s) = opts.shell {

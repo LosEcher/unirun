@@ -16,7 +16,7 @@
 //!   `aborted: true` (agent-safe retry semantics).
 
 use crate::coalesce::{CoalesceConfig, CoalescePolicy, OutputCoalescer};
-use crate::encoding::decode;
+use crate::encoding::decode_with;
 use crate::probe::which;
 use crate::process_identity::{self, ExpectedIdentity, IdentityVerdict};
 use crate::spec::{ExecKind, ExecResult, ExecSpec, Shell};
@@ -244,8 +244,8 @@ fn run_inner(
 
     let (stdout_raw, stdout_trunc) = join_capture(stdout_thread);
     let (stderr_raw, stderr_trunc) = join_capture(stderr_thread);
-    let stdout_decoded = decode(&stdout_raw);
-    let stderr_decoded = decode(&stderr_raw);
+    let stdout_decoded = decode_with(&stdout_raw, spec.output_encoding.as_deref());
+    let stderr_decoded = decode_with(&stderr_raw, spec.output_encoding.as_deref());
     let stdout = crate::encoding::normalize_line_endings(&stdout_decoded.text);
     let stderr = crate::encoding::normalize_line_endings(&stderr_decoded.text);
 

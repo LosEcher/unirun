@@ -101,6 +101,11 @@ pub struct ExecSpec {
     /// Project recipe `[error_maps]` patterns, consulted before the built-in
     /// error-map library during classification (project knowledge wins).
     pub error_maps: BTreeMap<String, ErrorMapEntry>,
+    /// Explicit code page for the captured output (`gbk`, `big5`, `cp437`,
+    /// `cp850`, `windows-1252`, …). `None` = auto-detect: valid UTF-8 as-is,
+    /// otherwise CP936/GBK when it decodes cleanly, else `utf-8-lossy`.
+    /// Set from `--output-encoding` or recipe `[conventions] encoding`.
+    pub output_encoding: Option<String>,
 }
 
 impl Default for ExecSpec {
@@ -117,6 +122,7 @@ impl Default for ExecSpec {
             direct: None,
             coalesce: CoalescePolicy::default(),
             error_maps: BTreeMap::new(),
+            output_encoding: None,
         }
     }
 }
@@ -166,7 +172,9 @@ pub struct ExecResult {
     pub error_class: Option<String>,
     /// Actionable remediation hint for the error class.
     pub hint: Option<String>,
-    /// Encoding the decoded output was produced in ("utf-8" | "utf-8-lossy" | "utf-16le" | "utf-16be").
+    /// How the captured output was decoded ("utf-8", "utf-8-lossy",
+    /// "utf-16le", "utf-16be", or a legacy page such as "gbk"/"big5"/"cp437").
+    /// Provenance, not proof: see `encoding::decode_with`.
     pub encoding: String,
     /// True when a stream exceeded the cap and only its tail was kept.
     pub truncated: bool,

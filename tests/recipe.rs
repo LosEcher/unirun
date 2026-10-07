@@ -83,6 +83,82 @@ fn cli_recipe_max_output_applied() {
 }
 
 #[test]
+fn cli_recipe_encoding_hint_decodes_legacy_output() {
+    // GBK bytes for 「你好」 are not valid UTF-8; the recipe declares the page.
+    let dir = tmp_dir("encoding");
+    write_recipe(&dir, "[conventions]\nencoding = \"gbk\"\n");
+    let out = Command::new(env!("CARGO_BIN_EXE_unirun"))
+        .args(["run", "printf '\\xc4\\xe3\\xba\\xc3\\n'", "--workdir"])
+        .arg(&dir)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {:?}", out.stderr);
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed["encoding"], serde_json::json!("gbk"));
+    assert_eq!(parsed["stdout"], serde_json::json!("你好\n"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cli_output_encoding_flag_beats_the_recipe() {
+    let dir = tmp_dir("encoding-flag");
+    write_recipe(&dir, "[conventions]\nencoding = \"gbk\"\n");
+    let out = Command::new(env!("CARGO_BIN_EXE_unirun"))
+        .args([
+            "run",
+            "printf '\\xc4\\xe3\\xba\\xc3\\n'",
+            "--output-encoding",
+            "utf-8",
+            "--workdir",
+        ])
+        .arg(&dir)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {:?}", out.stderr);
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        parsed["encoding"],
+        serde_json::json!("utf-8-lossy"),
+        "--output-encoding utf-8 must switch the guess off"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cli_unknown_output_encoding_is_a_usage_error() {
+    let out = Command::new(env!("CARGO_BIN_EXE_unirun"))
+        .args(["run", "echo hi", "--output-encoding", "klingon"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown encoding"),
+        "stderr: {:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn cli_bad_recipe_encoding_warns_and_falls_back() {
+    let dir = tmp_dir("encoding-bad");
+    write_recipe(&dir, "[conventions]\nencoding = \"klingon\"\n");
+    let out = Command::new(env!("CARGO_BIN_EXE_unirun"))
+        .args(["run", "echo hi", "--workdir"])
+        .arg(&dir)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("recipe [conventions] encoding"), "{stderr}");
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed["encoding"], serde_json::json!("utf-8"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn cli_toolchain_runner_executes_script() {
     let dir = tmp_dir("tc");
     write_recipe(

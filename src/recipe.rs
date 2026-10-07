@@ -120,6 +120,13 @@ impl Recipe {
         self.conventions.as_ref()?.max_output_bytes
     }
 
+    /// Declared code page for this project's captured output
+    /// (`[conventions] encoding`), used as the decode hint when the caller did
+    /// not pass `--output-encoding`.
+    pub fn output_encoding(&self) -> Option<String> {
+        self.conventions.as_ref()?.encoding.clone()
+    }
+
     pub fn default_timeout_ms(&self) -> Option<u64> {
         self.timeouts.as_ref()?.default_ms
     }

@@ -10,6 +10,13 @@ license = "MIT"
 repository = "https://github.com/LosEcher/unirun"
 keywords = ["exec", "cross-platform", "agent", "mcp", "normalization"]
 categories = ["command-line-utilities", "development-tools"]
+# `cargo package` includes untracked-but-not-ignored files, and `cargo publish`
+# runs on the working tree, so anything internal that is committed (or merely
+# lying around) reaches the published payload. Everything excluded here is
+# fleet-internal — a cross-repo execution audit, agent instructions, the fleet
+# profile scripts, CI config — and none of it is needed to build or use the
+# crate. `scripts/bench.sh` stays: the README points at it.
+exclude = ["docs/", "scripts/apply-build-profile.sh", "scripts/clean-build-artifacts.sh", "AGENTS.md", ".github/"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +24,16 @@ serde_json = "1"
 libc = "0.2"
 toml = "0.8"
 base64 = "0.22"
+# Legacy code-page decoding (CP936/GBK, CP950/Big5, CP1252). PowerShell 5.1
+# writes stderr through the OEM page even with the golden recipe applied, and
+# Windows OpenSSH answers with GBK error text — labelling those bytes
+# `utf-8-lossy` throws the text away. CP437/CP850 (OEM) are not in the
+# Encoding Standard, so those two tables live in `src/encoding.rs`.
+# Measured cost, `--profile dist` on this M1: 872,224 B → 1,037,568 B (+165 KB,
+# +19%): the GBK/Big5 mapping tables. Accepted because the README's "why" section
+# promises GBK and the promise was not true; revisit if `dist` size becomes a
+# constraint on the smallest target.
+encoding_rs = "0.8"
 psrp-rs = { version = "1", optional = true }
 winrm-rs = { version = "1", optional = true }
 

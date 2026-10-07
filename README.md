@@ -40,7 +40,13 @@ unirun makes this matrix a solved, tested, shared problem:
   `DEPENDENCY_MISSING`, `SYNTAX`, … plus actionable `hint`s, so an agent can
   take its next step instead of guessing.
 - **Encoding pipeline** — BOM sniffing (UTF-8/UTF-16LE/UTF-16BE), clean
-  UTF-8 fast path, lossy fallback labeled `utf-8-lossy`.
+  UTF-8 fast path, CP936/GBK auto-fallback for the usual Windows case
+  (PowerShell 5.1 writes *stderr* through the OEM page, and Windows OpenSSH
+  answers `uname` with GBK text), explicit hint for the rest
+  (`--output-encoding big5|cp437|cp850|windows-1252|utf-8`), and a lossy
+  fallback labeled `utf-8-lossy`. The `encoding` label says *how the bytes were
+  decoded* — `gbk` is an assumption CP936 could render cleanly, not a verified
+  fact.
 - **Capped tail-keeping output** — bounded, drained (no pipe deadlock), tail
   kept and marked `truncated` — errors cluster at the end. The cap is per
   stream and uniform across local, SSH and WinRM runs (`--max-output N`,
@@ -115,12 +121,12 @@ cd unirun && cargo build --release
 ## Usage
 
 ```bash
-unirun run '<command>' [--timeout 30] [--shell bash] [--workdir dir] [--env K=V] [--max-output N] [--no-coalesce]
+unirun run '<command>' [--timeout 30] [--shell bash] [--workdir dir] [--env K=V] [--max-output N] [--output-encoding NAME] [--no-coalesce]
 unirun script path/to/script [options]     # shell inferred from extension
 unirun probe [--json]                      # host capability snapshot
 unirun mcp                                 # serve MCP over stdio (agents)
 unirun acp                                 # serve Agent Client Protocol v1 over stdio
-unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--workdir dir] [--env K=V] [--timeout N] [--max-output N]   # remote SSH
+unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--workdir dir] [--env K=V] [--timeout N] [--max-output N] [--output-encoding NAME]   # remote SSH
 unirun winrm <host> '<script>' [opts]      # remote Windows (WinRM; feature: winrm)
 unirun bg <start|status|output|kill|wait|list> ...   # background sessions
 unirun recipe <list|show|add|rm|path|effective|check> # recipe registry
@@ -241,6 +247,8 @@ fallbacks = ["npm", "yarn"]
 
 [conventions]
 max_output_bytes = 262144
+encoding = "gbk"                   # decode captured output through CP936
+                                   # (utf-8 disables the auto GBK fallback)
 
 [timeouts]
 default_ms = 30000
