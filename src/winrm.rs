@@ -65,6 +65,10 @@ pub struct WinrmTarget {
     pub domain: String,
     pub auth: WinrmAuth,
     pub timeout_ms: u64,
+    /// Per-stream output cap in bytes; `0` → `DEFAULT_MAX_OUTPUT_BYTES`.
+    /// PSRP hands the whole stream over in memory, so the cap is applied while
+    /// assembling the result: only the tail is kept and `truncated` is set.
+    pub max_output_bytes: usize,
 }
 
 impl Default for WinrmTarget {
@@ -79,6 +83,7 @@ impl Default for WinrmTarget {
             domain: String::new(),
             auth: WinrmAuth::Ntlm,
             timeout_ms: 120_000,
+            max_output_bytes: 0,
         }
     }
 }
@@ -126,8 +131,11 @@ pub fn winrm_run(target: &WinrmTarget, script: &str) -> ExecResult {
                     stdout_lines.pop();
                 }
             }
-            let stdout = join_lines(stdout_lines);
-            let stderr = join_lines(pr.errors.iter().map(ps_error_text).collect());
+            let stdout_raw = join_lines(stdout_lines);
+            let stderr_raw = join_lines(pr.errors.iter().map(ps_error_text).collect());
+            let cap = output_cap(target);
+            let (stdout, out_truncated) = tail_keep(&stdout_raw, cap);
+            let (stderr, err_truncated) = tail_keep(&stderr_raw, cap);
             let shell_used = if cfg!(windows) {
                 "powershell"
             } else {
@@ -148,7 +156,7 @@ pub fn winrm_run(target: &WinrmTarget, script: &str) -> ExecResult {
                 error_class: None,
                 hint: None,
                 encoding: "utf-8".to_string(),
-                truncated: false,
+                truncated: out_truncated || err_truncated,
                 shell_used: shell_used.to_string(),
             }
         }
@@ -218,6 +226,30 @@ fn join_lines(lines: Vec<String>) -> String {
     out
 }
 
+/// Per-stream output cap for this target (`0` → the shared default).
+fn output_cap(target: &WinrmTarget) -> usize {
+    if target.max_output_bytes == 0 {
+        crate::spec::DEFAULT_MAX_OUTPUT_BYTES
+    } else {
+        target.max_output_bytes
+    }
+}
+
+/// Keep the tail `max` bytes of `text`, on a char boundary. Returns the kept
+/// text plus whether anything was dropped — the same tail-keeping contract the
+/// local and SSH paths implement, so `truncated` never lies.
+fn tail_keep(text: &str, max: usize) -> (String, bool) {
+    if text.len() <= max {
+        return (text.to_string(), false);
+    }
+    let cut = text.len() - max;
+    // Walk forward to the next char boundary so the kept slice is valid UTF-8.
+    let start = (cut..=text.len())
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(text.len());
+    (text[start..].to_string(), true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +273,34 @@ mod tests {
     fn join_lines_appends_newline() {
         assert_eq!(join_lines(vec![]), "");
         assert_eq!(join_lines(vec!["a".into(), "b".into()]), "a\nb\n");
+    }
+
+    #[test]
+    fn tail_keep_bounds_and_marks() {
+        let (kept, truncated) = tail_keep("abcdef", 3);
+        assert_eq!(kept, "def");
+        assert!(truncated);
+
+        let (all, not_truncated) = tail_keep("abc", 3);
+        assert_eq!(all, "abc");
+        assert!(!not_truncated);
+    }
+
+    /// The cap must never split a multi-byte character.
+    #[test]
+    fn tail_keep_respects_char_boundaries() {
+        let text = "中文中文"; // 4 chars × 3 bytes
+        let (kept, truncated) = tail_keep(text, 7);
+        assert!(truncated);
+        assert!(text.ends_with(&kept), "must be a suffix: {kept:?}");
+        assert!(kept.chars().count() >= 2, "kept {kept:?}");
+    }
+
+    #[test]
+    fn output_cap_defaults_and_honours_override() {
+        let mut t = WinrmTarget::default();
+        assert_eq!(output_cap(&t), crate::spec::DEFAULT_MAX_OUTPUT_BYTES);
+        t.max_output_bytes = 2048;
+        assert_eq!(output_cap(&t), 2048);
     }
 }

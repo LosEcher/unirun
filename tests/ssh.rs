@@ -40,6 +40,7 @@ fn unix_target(shell: Shell) -> SshTarget {
             .map(PathBuf::from),
         workdir: None,
         env: Vec::new(),
+        max_output_bytes: 0,
     }
 }
 

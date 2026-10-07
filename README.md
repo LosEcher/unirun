@@ -42,7 +42,9 @@ unirun makes this matrix a solved, tested, shared problem:
 - **Encoding pipeline** — BOM sniffing (UTF-8/UTF-16LE/UTF-16BE), clean
   UTF-8 fast path, lossy fallback labeled `utf-8-lossy`.
 - **Capped tail-keeping output** — bounded, drained (no pipe deadlock), tail
-  kept and marked `truncated` — errors cluster at the end.
+  kept and marked `truncated` — errors cluster at the end. The cap is per
+  stream and uniform across local, SSH and WinRM runs (`--max-output N`,
+  default 256 KiB).
 - **SIGINT = abort** — an in-flight process tree is terminated and the result
   reports `aborted: true` (agent-safe retry).
 - **Output coalescing** — streamed stdout chunks are merged into batches and
@@ -113,12 +115,12 @@ cd unirun && cargo build --release
 ## Usage
 
 ```bash
-unirun run '<command>' [--timeout 30] [--shell bash] [--workdir dir] [--env K=V] [--no-coalesce]
+unirun run '<command>' [--timeout 30] [--shell bash] [--workdir dir] [--env K=V] [--max-output N] [--no-coalesce]
 unirun script path/to/script [options]     # shell inferred from extension
 unirun probe [--json]                      # host capability snapshot
 unirun mcp                                 # serve MCP over stdio (agents)
 unirun acp                                 # serve Agent Client Protocol v1 over stdio
-unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--workdir dir] [--env K=V]   # remote SSH
+unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--workdir dir] [--env K=V] [--timeout N] [--max-output N]   # remote SSH
 unirun winrm <host> '<script>' [opts]      # remote Windows (WinRM; feature: winrm)
 unirun bg <start|status|output|kill|wait|list> ...   # background sessions
 unirun recipe <list|show|add|rm|path|effective|check> # recipe registry

@@ -36,6 +36,8 @@ OPTIONS:
   --shell <name>     bash | sh | zsh | cmd | powershell | pwsh
   --workdir <dir>    working directory
   --env K=V          environment override (repeatable)
+  --max-output <n>   per-stream output cap in bytes (default 262144); overflow
+                      keeps the tail and sets `truncated` (local/SSH/WinRM)
   --toolchain <name> run via a recipe toolchain runner (e.g. python -> uv run)
   --no-coalesce       disable output coalescing (streamed stdout is forwarded
                       in raw chunks instead of merged batches)
@@ -114,6 +116,9 @@ struct CliOpts {
     toolchain: Option<String>,
     label: Option<String>,
     tail_bytes: Option<usize>,
+    /// Per-stream output cap in bytes (`--max-output`); applies to local,
+    /// SSH and WinRM runs alike. `None`/`0` → the shared default (256 KiB).
+    max_output_bytes: Option<usize>,
     no_coalesce: bool,
     json: bool,
     pretty: bool,
@@ -191,6 +196,12 @@ fn parse_flags(args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, Strin
                 let v = args.get(i).ok_or("--tail needs a value")?;
                 opts.tail_bytes = Some(v.parse().map_err(|_| "invalid --tail (byte count)")?);
             }
+            "--max-output" => {
+                i += 1;
+                let v = args.get(i).ok_or("--max-output needs a value")?;
+                opts.max_output_bytes =
+                    Some(v.parse().map_err(|_| "invalid --max-output (byte count)")?);
+            }
             _ => positional.push(a.clone()),
         }
         i += 1;
@@ -206,6 +217,7 @@ fn build_spec(command: String, kind: ExecKind, opts: &CliOpts) -> ExecSpec {
         workdir: opts.workdir.clone(),
         env: opts.env.clone(),
         timeout_ms: opts.timeout_sec.map(|s| s * 1000).unwrap_or(0),
+        max_output_bytes: opts.max_output_bytes.unwrap_or(0),
         coalesce: if opts.no_coalesce {
             CoalescePolicy::Off
         } else {
@@ -362,7 +374,7 @@ fn cmd_ssh(args: &[String]) -> ExitCode {
         }
     };
     if positional.len() < 2 {
-        eprintln!("unirun ssh: usage: unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--workdir DIR] [--env K=V] [--timeout N]");
+        eprintln!("unirun ssh: usage: unirun ssh <host> '<script>' [--shell bash|sh|zsh|powershell|pwsh|cmd] [--user U] [--port N] [--identity FILE] [--workdir DIR] [--env K=V] [--timeout N] [--max-output N]");
         return ExitCode::from(2);
     }
     let mut target = unirun::SshTarget {
@@ -372,6 +384,7 @@ fn cmd_ssh(args: &[String]) -> ExitCode {
         identity_file: opts.identity.clone(),
         workdir: opts.workdir.clone(),
         env: opts.env.clone(),
+        max_output_bytes: opts.max_output_bytes.unwrap_or(0),
         ..Default::default()
     };
     if let Some(s) = opts.shell {
@@ -810,7 +823,7 @@ unirun winrm — run PowerShell on a remote Windows host over WinRM (psrp-rs POC
 USAGE:
   unirun winrm <host> '<script>' [--user U] [--password P] [--domain D]
                [--port N] [--tls] [--insecure] [--auth basic|ntlm|kerberos]
-               [--timeout N] [--json] [--pretty]
+               [--timeout N] [--max-output N] [--json] [--pretty]
 
 Defaults: HTTP port 5985, NTLM auth. Requires a `winrm`-feature build
 (cargo install unirun --features winrm).
@@ -872,6 +885,10 @@ fn cmd_winrm(args: &[String]) -> ExitCode {
             "--timeout" => match next(&mut i).and_then(|v| v.parse().ok()) {
                 Some(t) => timeout_sec = Some(t),
                 None => return fail("--timeout needs integer seconds"),
+            },
+            "--max-output" => match next(&mut i).and_then(|v| v.parse().ok()) {
+                Some(m) => target.max_output_bytes = m,
+                None => return fail("--max-output needs a byte count"),
             },
             other => positional.push(other.to_string()),
         }

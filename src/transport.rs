@@ -12,7 +12,7 @@
 //! travels over stdin to `<shell> -s`, so no outer quoting layer can corrupt
 //! it, and the script's own exit code propagates exactly.
 
-use crate::spec::{ExecResult, Shell};
+use crate::spec::{ExecResult, Shell, DEFAULT_MAX_OUTPUT_BYTES};
 use crate::taxonomy::classify;
 use base64::Engine;
 use std::io::{Read, Write};
@@ -23,10 +23,30 @@ use std::time::{Duration, Instant};
 
 const GOLDEN_PREFIX: &str = "$ProgressPreference='SilentlyContinue'\n[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$OutputEncoding=[Text.Encoding]::UTF8\n";
 const EXIT_CONTRACT: &str = "\nexit $LASTEXITCODE\n";
-/// EncodedCommand base64 length beyond which we fall back to scp + `-File`
-/// (CreateProcess command-line limit ≈ 32 KB; this threshold is conservative).
-const B64_THRESHOLD: usize = 60_000;
-const MAX_OUTPUT: usize = 256 * 1024;
+/// EncodedCommand base64 length beyond which we fall back to scp + `-File`.
+///
+/// `CreateProcess` caps the whole command line at 32 767 UTF-16 units, and our
+/// `-EncodedCommand` line is `powershell.exe -NoProfile -NonInteractive
+/// -EncodedCommand <b64>` — so the base64 payload must leave room for the
+/// prefix. 30 000 keeps ~2.7 KB of headroom and still keeps the common case
+/// (inline EncodedCommand, no scp round-trip) fast. The previous value of
+/// 60 000 *exceeded the limit it claimed to be conservative about*, so a
+/// ~12–22 KB PowerShell body silently built an unusable remote command line.
+const B64_THRESHOLD: usize = 30_000;
+/// Length of the fixed part of the inline `-EncodedCommand` remote command
+/// line: `<exe> -NoProfile -NonInteractive -EncodedCommand ` where `<exe>` is
+/// the shorter of the two PowerShell names (`pwsh.exe`). Used to prove the
+/// threshold leaves room inside `CreateProcess`'s 32 767-unit limit.
+const ENCODED_COMMAND_PREFIX: usize = "pwsh.exe -NoProfile -NonInteractive -EncodedCommand ".len();
+/// `CreateProcess` caps the entire command line at 32 767 UTF-16 units.
+const CREATEPROCESS_COMMAND_LINE_LIMIT: usize = 32_767;
+/// Compile-time proof that an accepted inline payload always fits.
+const _: () = assert!(ENCODED_COMMAND_PREFIX + B64_THRESHOLD < CREATEPROCESS_COMMAND_LINE_LIMIT);
+
+/// Can this base64 payload travel inline, or must it go over scp + `-File`?
+fn inline_encoded_command_fits(b64_len: usize) -> bool {
+    b64_len <= B64_THRESHOLD && ENCODED_COMMAND_PREFIX + b64_len < CREATEPROCESS_COMMAND_LINE_LIMIT
+}
 
 /// Remote host + shell selection for SSH execution.
 #[derive(Debug, Clone)]
@@ -47,6 +67,9 @@ pub struct SshTarget {
     pub workdir: Option<PathBuf>,
     /// Optional remote environment overrides.
     pub env: Vec<(String, String)>,
+    /// Per-stream output cap in bytes; `0` → `DEFAULT_MAX_OUTPUT_BYTES`.
+    /// Overflow is drained and only the tail is kept, flagged `truncated`.
+    pub max_output_bytes: usize,
 }
 
 impl Default for SshTarget {
@@ -61,6 +84,7 @@ impl Default for SshTarget {
             identity_file: None,
             workdir: None,
             env: Vec::new(),
+            max_output_bytes: 0,
         }
     }
 }
@@ -174,7 +198,7 @@ fn ssh_powershell(target: &SshTarget, script: &str) -> ExecResult {
     };
     let payload = format!("{}{}{}", GOLDEN_PREFIX, script.trim_end(), EXIT_CONTRACT);
     let b64 = base64_utf16le(&payload);
-    if b64.len() <= B64_THRESHOLD {
+    if inline_encoded_command_fits(b64.len()) {
         let remote_cmd = format!("{} -NoProfile -NonInteractive -EncodedCommand {}", exe, b64);
         run_ssh(target, &remote_cmd, None)
     } else {
@@ -258,8 +282,9 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) ->
 
     let so = child.stdout.take().unwrap();
     let se = child.stderr.take().unwrap();
-    let to = thread::spawn(move || read_capped(so, MAX_OUTPUT));
-    let te = thread::spawn(move || read_capped(se, MAX_OUTPUT));
+    let max = output_cap(target);
+    let to = thread::spawn(move || read_capped(so, max));
+    let te = thread::spawn(move || read_capped(se, max));
 
     let timeout = Duration::from_millis(if target.timeout_ms == 0 {
         120_000
@@ -293,10 +318,54 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) ->
             }
         }
     }
-    let (out_raw, _) = to.join().unwrap_or((Vec::new(), false));
-    let (err_raw, _) = te.join().unwrap_or((Vec::new(), false));
-    let stdout_decoded = crate::encoding::decode(&out_raw);
-    let stderr_raw = filter_banner(&err_raw);
+    let (out_bytes, out_truncated) = to.join().unwrap_or((Vec::new(), false));
+    let (err_bytes, err_truncated) = te.join().unwrap_or((Vec::new(), false));
+    assemble_ssh_result(
+        target,
+        exit_code,
+        timed_out,
+        StreamCapture {
+            bytes: out_bytes,
+            truncated: out_truncated,
+        },
+        StreamCapture {
+            bytes: err_bytes,
+            truncated: err_truncated,
+        },
+        start.elapsed().as_millis() as u64,
+    )
+}
+
+/// One captured stream: the (tail-kept) bytes plus whether the cap was hit.
+struct StreamCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+/// Per-stream output cap for this target (`0` → the shared default).
+fn output_cap(target: &SshTarget) -> usize {
+    if target.max_output_bytes == 0 {
+        DEFAULT_MAX_OUTPUT_BYTES
+    } else {
+        target.max_output_bytes
+    }
+}
+
+/// Assemble the normalized result from the captured streams.
+///
+/// Extracted from `run_ssh` so the truncation flags `read_capped` produces are
+/// provably *not* dropped on the way into `ExecResult` — the bug this function
+/// exists to prevent — without needing a live host in the test suite.
+fn assemble_ssh_result(
+    target: &SshTarget,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    stdout_capture: StreamCapture,
+    stderr_capture: StreamCapture,
+    duration_ms: u64,
+) -> ExecResult {
+    let stdout_decoded = crate::encoding::decode(&stdout_capture.bytes);
+    let stderr_raw = filter_banner(&stderr_capture.bytes);
     let stderr_decoded = crate::encoding::decode(&stderr_raw);
     let stdout = crate::encoding::normalize_line_endings(&stdout_decoded.text);
     let stderr = crate::encoding::normalize_line_endings(&stderr_decoded.text);
@@ -308,11 +377,11 @@ fn run_ssh(target: &SshTarget, remote_cmd: &str, stdin_payload: Option<&str>) ->
         stderr,
         timed_out,
         aborted: false,
-        duration_ms: start.elapsed().as_millis() as u64,
+        duration_ms,
         error_class: None,
         hint: None,
         encoding: stdout_decoded.encoding.to_string(),
-        truncated: false,
+        truncated: stdout_capture.truncated || stderr_capture.truncated,
         shell_used: target.shell.as_str().to_string(),
     };
     let (class, hint) = classify(&result);
@@ -506,7 +575,101 @@ mod tests {
             identity_file: None,
             workdir: None,
             env: Vec::new(),
+            max_output_bytes: 0,
         }
+    }
+
+    fn capture(bytes: &[u8], truncated: bool) -> StreamCapture {
+        StreamCapture {
+            bytes: bytes.to_vec(),
+            truncated,
+        }
+    }
+
+    #[test]
+    fn output_cap_defaults_and_honours_override() {
+        assert_eq!(output_cap(&target()), DEFAULT_MAX_OUTPUT_BYTES);
+        let mut t = target();
+        t.max_output_bytes = 4096;
+        assert_eq!(output_cap(&t), 4096);
+    }
+
+    /// Regression: the per-stream truncation flags returned by `read_capped`
+    /// used to be discarded (`let (out_raw, _) = …`) and `truncated` was
+    /// hard-coded `false`, so a remote run could hand back a silently
+    /// incomplete stdout while claiming it was complete.
+    #[test]
+    fn truncation_from_either_stream_reaches_the_result() {
+        let t = target();
+        let out_hit = assemble_ssh_result(
+            &t,
+            Some(0),
+            false,
+            capture(b"tail-of-stdout", true),
+            capture(b"", false),
+            7,
+        );
+        assert!(out_hit.truncated, "stdout truncation must be reported");
+        assert_eq!(out_hit.exit_code, Some(0));
+        assert_eq!(out_hit.duration_ms, 7);
+
+        let err_hit = assemble_ssh_result(
+            &t,
+            Some(0),
+            false,
+            capture(b"", false),
+            capture(b"tail-of-stderr", true),
+            3,
+        );
+        assert!(err_hit.truncated, "stderr truncation must be reported");
+        // `filter_banner` re-terminates each surviving line with `\n`.
+        assert_eq!(err_hit.stderr, "tail-of-stderr\n");
+    }
+
+    #[test]
+    fn untruncated_and_timed_out_results_stay_unmarked() {
+        let t = target();
+        let r = assemble_ssh_result(
+            &t,
+            None,
+            true,
+            capture(b"partial", false),
+            capture(b"", false),
+            1,
+        );
+        assert!(!r.truncated);
+        assert!(r.timed_out);
+        assert_eq!(r.exit_code, None);
+        assert_eq!(r.shell_used, "bash");
+    }
+
+    /// The cap must actually bound the reader: 8 KiB chunks, tail kept.
+    #[test]
+    fn read_capped_reports_and_keeps_the_tail() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let (tail, truncated) = read_capped(std::io::Cursor::new(data.clone()), 1024);
+        assert!(truncated);
+        assert_eq!(tail.len(), 1024);
+        assert_eq!(tail, &data[data.len() - 1024..]);
+
+        let (all, not_truncated) = read_capped(std::io::Cursor::new(data.clone()), 20_000);
+        assert!(!not_truncated);
+        assert_eq!(all, data);
+    }
+
+    /// The threshold must leave room for the `-EncodedCommand` prefix inside
+    /// `CreateProcess`'s 32 767-unit command-line limit (A14). A ~35 000-char
+    /// base64 payload (≈13 KB of PowerShell) used to be sent inline by the old
+    /// 60 000 threshold and could never have fit.
+    #[test]
+    fn inline_payloads_fit_the_createprocess_limit() {
+        assert!(inline_encoded_command_fits(0));
+        assert!(inline_encoded_command_fits(B64_THRESHOLD));
+        assert!(!inline_encoded_command_fits(B64_THRESHOLD + 1));
+        assert!(
+            !inline_encoded_command_fits(35_000),
+            "a 35k base64 payload must fall back to scp + -File"
+        );
     }
 
     #[test]
