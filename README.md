@@ -553,15 +553,28 @@ The crate itself is published by hand from a clean tree at the tagged commit,
 because a crates.io release is irreversible (a version can be yanked but never
 deleted or replaced).
 
+`scripts/release.sh` makes that sequence fail-closed instead of a checklist:
+
 ```sh
-# 1. bump `version` in Cargo.toml and refresh the lockfile
+# 1. bump `version` in Cargo.toml, add the CHANGELOG section, commit
 cargo check --all-targets
-git commit -am "chore(release): X.Y.Z" && git push origin main
-# 2. once main is green (test × 3 platforms + msrv), tag that exact commit
-git tag vX.Y.Z && git push origin vX.Y.Z
-# 3. after the release job publishes the five platform assets
+
+# 2. verify everything, change nothing (the default): clean tree on main,
+#    Cargo.toml = Cargo.lock = planned tag, CHANGELOG entry present,
+#    fmt --check, clippy ×2, tests ×2, `cargo publish --dry-run`, and the
+#    payload-hygiene gate that keeps internal docs out of the .crate
+scripts/release.sh
+
+# 3. push main and the tag once step 2 is green (CI builds the five assets)
+scripts/release.sh --push
+
+# 4. after CI is green and the assets exist: publish the crate (irreversible)
 cargo publish
 ```
+
+Every gate must pass before anything leaves the machine, and `--publish` (which
+appends `cargo publish` to the same run) is a separate flag precisely because
+that step cannot be undone.
 
 ## License
 

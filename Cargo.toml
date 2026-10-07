@@ -29,10 +29,11 @@ base64 = "0.22"
 # Windows OpenSSH answers with GBK error text — labelling those bytes
 # `utf-8-lossy` throws the text away. CP437/CP850 (OEM) are not in the
 # Encoding Standard, so those two tables live in `src/encoding.rs`.
-# Measured cost, `--profile dist` on this M1: 872,224 B → 1,037,568 B (+165 KB,
-# +19%): the GBK/Big5 mapping tables. Accepted because the README's "why" section
-# promises GBK and the promise was not true; revisit if `dist` size becomes a
-# constraint on the smallest target.
+# Measured cost, `--profile dist` on this M1: 872,224 B (0.4.0) → 1,037,568 B
+# with just the tables (+165 KB, +19%), and 1,087,536 B at 0.5.0 with the rest of
+# P5. Accepted because the README's "why" section promises GBK and the promise
+# was not true; revisit if `dist` size becomes a constraint on the smallest
+# target.
 encoding_rs = "0.8"
 psrp-rs = { version = "1", optional = true }
 winrm-rs = { version = "1", optional = true }

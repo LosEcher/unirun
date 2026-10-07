@@ -55,7 +55,7 @@
 | A6 远端会话（`ssh --detach`） | ✅ 已完成 | POSIX 远端脱附（`setsid` 优先/`nohup` 兜底、日志与 exit 码写远端文件、`$$` 记录 pid）；会话记录加 `RemoteSession`（含 host/pid/log/rc/身份参数），`bg status/output/output_since/kill` 走远端；Windows 目标明确 `UNSUPPORTED`+指路 schtasks；能力键 `ssh-detach`；单测 + 需真机的 ignored E2E |
 | A9 稳定 lib API + 0.5.0 发布 | ⏳ 待办 | |
 | A9 稳定 lib API | ✅ 已完成 | `lib.rs` 写明稳定面（字段只增不改）；`run_with_abort`/`run_with_abort_streaming` 提升为公开嵌入 API（自带取消标志）；新增 `tests/lib_cli_parity.rs`（5 例：成功/带证据失败/超时+kill_status/截断/调用方取消，逐字段比对 lib 与 CLI JSON） |
-| 0.5.0 发布准备 | ✅ 已完成（待人工两步） | 版本 0.4.0 → 0.5.0（Cargo.lock 同步）、新增 `CHANGELOG.md`（含 breaking 说明）、README 增 P5 路线行/`## Library`/「Upgrading from 0.4.x」；`cargo publish --dry-run` 通过、`cargo package --list` 37 个文件且无内部文件泄漏。**剩余人工步骤**：`git push origin main` → `git tag v0.5.0 && git push origin v0.5.0` → CI 三平台绿 + 5 资产发布 → `cargo publish`（不可逆，需凭据） |
+| 0.5.0 发布准备 | ✅ 已完成（待人工两步） | 版本 0.4.0 → 0.5.0（Cargo.lock 同步）、新增 `CHANGELOG.md`（含 breaking 说明）、README 增 P5 路线行/`## Library`/「Upgrading from 0.4.x」；`cargo publish --dry-run` 通过、`cargo package --list` 37 个文件且无内部文件泄漏。**剩余人工步骤**：`scripts/release.sh`（8 道门禁，默认 dry-run，已验证全绿）→ `scripts/release.sh --push`（push main + tag，CI 出 5 资产）→ `cargo publish`（不可逆）。另记：0.5.0 的 `dist` 产物 1,087,536 B（0.4.0 为 872,224 B） |
 
 ## 1. 口径：什么算「本项目范畴」
 
