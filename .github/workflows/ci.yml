@@ -44,6 +44,12 @@ jobs:
         # `Cargo.toml` excludes the fleet-internal docs/scripts/agent notes. This
         # gate is what keeps that line from being quietly deleted: the payload is
         # the product, and a cross-repo audit note is not part of it.
+        #
+        # `shell: bash` is required: this is the only step in the test job that is
+        # a shell script rather than a cargo invocation, and the default shell on
+        # windows-latest is PowerShell (the first tag run failed with
+        # "Missing '(' after 'if' in if statement").
+        shell: bash
         run: |
           set -euo pipefail
           cargo package --list --allow-dirty > /tmp/pkg-list.txt
