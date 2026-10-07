@@ -893,6 +893,22 @@ mod tests {
     use super::*;
     use crate::spec::ExecSpec;
 
+    /// Serializes the tests that spawn a process.
+    ///
+    /// Concurrent spawning inside one process has an fd race: a child forked
+    /// while another test sits between its pipe creation and its `spawn` can
+    /// inherit that pipe's write end, so the owner never sees EOF and
+    /// `drain_timeout` fires on a run that had already finished — observed once
+    /// as `a_normal_run_reports_no_drain_timeout` failing with
+    /// `duration_ms: 2020` under `scripts/release.sh`. The product behaviour it
+    /// exposed is correct (a stray writer is exactly what the drain bounds);
+    /// serializing removes the test-only window.
+    fn spawn_serial() -> std::sync::MutexGuard<'static, ()> {
+        crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn sh_ok(command: &str) -> ExecSpec {
         ExecSpec {
             command: command.to_string(),
@@ -951,6 +967,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_grandchild_holding_the_pipe_does_not_hang_the_run() {
+        let _guard = spawn_serial();
         let mut spec = sh_ok("sleep 5 & echo started");
         spec.drain_ms = 1_000;
         let start = Instant::now();
@@ -977,6 +994,7 @@ mod tests {
     /// capture is complete.
     #[test]
     fn a_normal_run_reports_no_drain_timeout() {
+        let _guard = spawn_serial();
         let r = run(&sh_ok("echo quick"));
         assert!(!r.drain_timeout, "{r:?}");
         assert_eq!(r.stdout, "quick\n");
@@ -987,6 +1005,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_term_ignoring_child_reports_an_escalated_kill() {
+        let _guard = spawn_serial();
         let mut spec = sh_ok("trap '' TERM; sleep 30");
         spec.timeout_ms = 300;
         spec.grace_ms = 200;
@@ -1004,6 +1023,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_cooperative_child_reports_a_clean_kill() {
+        let _guard = spawn_serial();
         let mut spec = sh_ok("sleep 30");
         spec.timeout_ms = 300;
         spec.grace_ms = 2_000;
@@ -1015,6 +1035,7 @@ mod tests {
     /// No signal, no `kill_status`: the process ended on its own.
     #[test]
     fn a_completed_run_has_no_kill_status() {
+        let _guard = spawn_serial();
         let r = run(&sh_ok("echo done"));
         assert_eq!(r.kill_status, None);
         assert_eq!(r.exit_code_confidence, ExitCodeConfidence::Observed);
@@ -1129,6 +1150,7 @@ mod tests {
     /// safely resubmit; every completed run reports `dispatched: true`.
     #[test]
     fn dispatched_reflects_whether_the_command_could_have_run() {
+        let _guard = spawn_serial();
         let missing = ExecSpec {
             kind: crate::spec::ExecKind::Run,
             direct: Some(vec!["/nonexistent/unirun-probe-binary".into()]),
@@ -1177,6 +1199,7 @@ mod tests {
 
     #[test]
     fn run_streaming_matches_run_and_splits_streams() {
+        let _guard = spawn_serial();
         if which("bash").is_none() {
             return; // windows CI images without bash
         }
@@ -1212,6 +1235,7 @@ mod tests {
 
     #[test]
     fn run_with_custom_abort_flag_reports_aborted() {
+        let _guard = spawn_serial();
         if which("bash").is_none() {
             return;
         }
@@ -1228,6 +1252,7 @@ mod tests {
     /// `ABORTED` on the ubuntu runner.
     #[test]
     fn verify_before_kill_waits_out_the_fork_exec_window() {
+        let _guard = spawn_serial();
         if !process_identity::platform_probe_available() {
             eprintln!("skipping: this environment cannot report process identities");
             return;
@@ -1255,6 +1280,7 @@ mod tests {
 
     #[test]
     fn generation_token_injection_does_not_change_output() {
+        let _guard = spawn_serial();
         if which("bash").is_none() {
             return;
         }
@@ -1277,6 +1303,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn default_shell_run_reports_no_spurious_error() {
+        let _guard = spawn_serial();
         let spec = ExecSpec {
             command: "echo unirun-default-shell".into(),
             ..Default::default()
@@ -1294,6 +1321,7 @@ mod tests {
     /// away its token must still be terminated — the verdict is reported.
     #[test]
     fn kill_gate_never_refuses_an_owned_child() {
+        let _guard = spawn_serial();
         assert_eq!(kill_gate(&IdentityVerdict::NotRunning), KillGate::Skip);
         assert_eq!(kill_gate(&IdentityVerdict::Matches), KillGate::Signal);
         let unconfirmed = [
@@ -1323,6 +1351,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cleared_environment_child_is_still_killed_and_reported() {
+        let _guard = spawn_serial();
         if which("bash").is_none() || which("env").is_none() {
             return;
         }
@@ -1371,6 +1400,7 @@ mod tests {
 
     #[test]
     fn generation_token_visible_in_child_env() {
+        let _guard = spawn_serial();
         if which("bash").is_none() {
             return;
         }
@@ -1385,6 +1415,7 @@ mod tests {
 
     #[test]
     fn no_coalesce_streams_same_content() {
+        let _guard = spawn_serial();
         if which("bash").is_none() {
             return;
         }
@@ -1412,6 +1443,7 @@ mod tests {
 
     #[test]
     fn direct_argv_runs_are_unaffected_by_injection() {
+        let _guard = spawn_serial();
         if cfg!(windows) {
             return; // no standalone `echo` binary on Windows
         }
