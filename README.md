@@ -75,7 +75,10 @@ unirun makes this matrix a solved, tested, shared problem:
   leaving the tree alive or claiming a reuse that never happened. Zombies are
   treated as already gone.
 - **`unirun probe`** — the agent's first question answered: what shells,
-  coreutils and tools actually exist here.
+  coreutils and tools actually exist here. Every lookup is three-state —
+  `found`, `absent`, `unreadable` — with the unreadable ones listed under
+  `unreadable`, because "I could not check" must never read as "this host does
+  not have it" (the same distinction the process probe makes).
 
 Each of those differences is written down in
 [docs/PLATFORM-DIFFS.md](docs/PLATFORM-DIFFS.md) with the witness it was learned
@@ -159,7 +162,7 @@ version→feature table:
  "platform":{"os":"macos","arch":"aarch64"},
  "features":["local-exec","probe","mcp","acp","bg-session","recipe-registry",
              "recipe-toolchain","ssh","ssh-identity","ssh-workdir-env",
-             "remote-abort","mcp-cancel",
+             "remote-abort","mcp-cancel","probe-state",
              "error-taxonomy","output-cap","truncation-flag","transport-error",
              "dispatched","kill-status","exit-code-confidence","drain-timeout",
              "legacy-codepage","encoding-hint","strict-flags"]}

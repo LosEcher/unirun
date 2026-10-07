@@ -7,17 +7,78 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// What a probe could establish about one name.
+///
+/// Three states, not two: "absent" and "could not check" are different facts,
+/// and collapsing them made a blocked PATH scan read as "this host has no
+/// python" (the same confusion `process_identity` fixed for process liveness —
+/// `Observed::{Alive,Gone,Unreadable}`). Callers that only need "is it usable"
+/// can treat `Unreadable` as `Absent`; callers that report on a fleet must not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbeState {
+    /// Found at `path`.
+    Found,
+    /// Looked for it and it is genuinely not there.
+    Absent,
+    /// The check itself could not be completed (a PATH entry that could not be
+    /// read), so nothing can be said either way.
+    Unreadable,
+}
+
+impl ProbeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeState::Found => "found",
+            ProbeState::Absent => "absent",
+            ProbeState::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// One probe result: the state, plus a path when there is one.
+#[derive(Debug, Clone)]
+pub struct ProbeOutcome {
+    pub path: Option<String>,
+    pub state: ProbeState,
+}
+
+impl ProbeOutcome {
+    fn found(path: String) -> Self {
+        ProbeOutcome {
+            path: Some(path),
+            state: ProbeState::Found,
+        }
+    }
+    fn absent() -> Self {
+        ProbeOutcome {
+            path: None,
+            state: ProbeState::Absent,
+        }
+    }
+    fn unreadable() -> Self {
+        ProbeOutcome {
+            path: None,
+            state: ProbeState::Unreadable,
+        }
+    }
+}
+
 /// A tool found (or not) on PATH.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInfo {
     pub name: String,
     pub path: Option<String>,
+    /// `found` | `absent` | `unreadable` — see [`ProbeState`].
+    pub state: ProbeState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellInfo {
     pub name: String,
     pub path: Option<String>,
+    /// `found` | `absent` | `unreadable` — see [`ProbeState`].
+    pub state: ProbeState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +98,11 @@ pub struct Capabilities {
     pub shells: Vec<ShellInfo>,
     pub coreutils: CoreutilsInfo,
     pub tools: Vec<ToolInfo>,
+    /// Coverage honesty: the names this probe could **not** check. Empty means
+    /// every lookup completed, so an `absent` really is absent. A non-empty list
+    /// means the rest of the snapshot is fine but incomplete — report it instead
+    /// of pretending the host is bare.
+    pub unreadable: Vec<String>,
 }
 
 /// Resolve a command to its absolute path by scanning PATH, or `None`.
@@ -44,31 +110,68 @@ pub struct Capabilities {
 /// because `cmd` exists as `cmd.exe` (CreateProcess resolves extensions,
 /// but a PATH file-scan must do so explicitly).
 pub fn which(name: &str) -> Option<String> {
+    which_state(name).path
+}
+
+/// [`which`] with three-state semantics: `Found`, `Absent`, or `Unreadable`
+/// when a PATH entry could not be read at all.
+pub fn which_state(name: &str) -> ProbeOutcome {
     if name.contains('/') || name.contains('\\') {
-        let p = Path::new(name);
-        return if p.is_file() {
-            Some(p.to_string_lossy().into_owned())
-        } else {
-            None
-        };
+        return scan_one(Path::new(name));
     }
-    for dir in path_entries() {
+    scan_dirs(name, &path_entries())
+}
+
+/// One explicit path (contains a separator): exists or not, no PATH involved.
+fn scan_one(p: &Path) -> ProbeOutcome {
+    match std::fs::metadata(p) {
+        Ok(md) if md.is_file() => ProbeOutcome::found(p.to_string_lossy().into_owned()),
+        Ok(_) => ProbeOutcome::absent(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProbeOutcome::absent(),
+        Err(_) => ProbeOutcome::unreadable(),
+    }
+}
+
+/// Scan PATH entries for `name`. Pure over `dirs`, so the unreadable branch is
+/// testable (a directory that cannot be read) on any machine that is not root.
+fn scan_dirs(name: &str, dirs: &[PathBuf]) -> ProbeOutcome {
+    let mut unreadable = false;
+    for dir in dirs {
+        // A directory we cannot even open cannot be searched: distinguish that
+        // from "the file is not there".
+        match std::fs::read_dir(dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unreadable = true;
+                continue;
+            }
+        }
         for cand_name in executable_candidates(name) {
             let cand = dir.join(&cand_name);
-            if cand.is_file() {
-                if is_wsl_bash_shim(&cand) {
-                    // Windows: %SystemRoot%\System32\bash.exe is the WSL
-                    // launcher, not a usable bash — with no distro installed
-                    // it prints a UTF-16LE "no distributions" message and
-                    // exits 1. Treat it as absent so probe/recipes/tests
-                    // never route through it (Git Bash lives elsewhere).
-                    continue;
+            match std::fs::metadata(&cand) {
+                Ok(md) if md.is_file() => {
+                    if is_wsl_bash_shim(&cand) {
+                        // Windows: %SystemRoot%\System32\bash.exe is the WSL
+                        // launcher, not a usable bash — with no distro installed
+                        // it prints a UTF-16LE "no distributions" message and
+                        // exits 1. Treat it as absent so probe/recipes/tests
+                        // never route through it (Git Bash lives elsewhere).
+                        continue;
+                    }
+                    return ProbeOutcome::found(cand.to_string_lossy().into_owned());
                 }
-                return Some(cand.to_string_lossy().into_owned());
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => unreadable = true,
             }
         }
     }
-    None
+    if unreadable {
+        ProbeOutcome::unreadable()
+    } else {
+        ProbeOutcome::absent()
+    }
 }
 
 /// `System32\bash.exe` on Windows is always the WSL launcher, never a real
@@ -124,28 +227,51 @@ fn path_entries() -> Vec<PathBuf> {
 
 /// Full capability snapshot for the current host.
 pub fn probe() -> Capabilities {
+    let mut unreadable: Vec<String> = Vec::new();
     let shell_names: &[&str] = &["bash", "sh", "zsh", "pwsh", "powershell", "cmd"];
-    let shells = shell_names
+    let shells: Vec<ShellInfo> = shell_names
         .iter()
-        .map(|n| ShellInfo {
-            name: (*n).to_string(),
-            path: which(n),
+        .map(|n| {
+            let o = which_state(n);
+            if o.state == ProbeState::Unreadable {
+                unreadable.push((*n).to_string());
+            }
+            ShellInfo {
+                name: (*n).to_string(),
+                path: o.path,
+                state: o.state,
+            }
         })
         .collect();
 
-    let timeout = which("timeout");
-    let gtimeout = which("gtimeout");
+    let timeout_outcome = which_state("timeout");
+    let gtimeout_outcome = which_state("gtimeout");
+    if timeout_outcome.state == ProbeState::Unreadable {
+        unreadable.push("timeout".to_string());
+    }
+    if gtimeout_outcome.state == ProbeState::Unreadable {
+        unreadable.push("gtimeout".to_string());
+    }
+    let timeout = timeout_outcome.path.clone();
+    let gtimeout = gtimeout_outcome.path.clone();
     let gnu_timeout_available =
         timeout.is_some() && is_gnu_coreutils("timeout") || gtimeout.is_some();
 
     let tool_names: &[&str] = &[
         "python3", "node", "git", "curl", "uname", "sed", "awk", "find", "rsync", "tar",
     ];
-    let tools = tool_names
+    let tools: Vec<ToolInfo> = tool_names
         .iter()
-        .map(|n| ToolInfo {
-            name: (*n).to_string(),
-            path: which(n),
+        .map(|n| {
+            let o = which_state(n);
+            if o.state == ProbeState::Unreadable {
+                unreadable.push((*n).to_string());
+            }
+            ToolInfo {
+                name: (*n).to_string(),
+                path: o.path,
+                state: o.state,
+            }
         })
         .collect();
 
@@ -159,6 +285,7 @@ pub fn probe() -> Capabilities {
             gnu_timeout_available,
         },
         tools,
+        unreadable,
     }
 }
 
@@ -229,6 +356,105 @@ mod tests {
         assert_eq!(executable_candidates_for("python", false), vec!["python"]);
         // A name that already carries an extension is left alone.
         assert_eq!(executable_candidates_for("run.cmd", true), vec!["run.cmd"]);
+    }
+
+    /// A PATH entry that cannot be read is `unreadable`, not `absent`: reporting
+    /// "this host has no python" because a directory was blocked is the same
+    /// mistake as calling an unreadable process "gone".
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_path_entries_are_not_reported_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("unirun-probe-{}", std::process::id()));
+        let locked = base.join("locked");
+        let open = base.join("open");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::write(locked.join("bash"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(open.join("bash"), b"#!/bin/sh\n").unwrap();
+
+        // A readable directory resolves, an empty one is simply absent.
+        assert_eq!(
+            scan_dirs("bash", std::slice::from_ref(&open)).state,
+            ProbeState::Found
+        );
+        assert_eq!(
+            scan_dirs("bash", &[base.join("nowhere")]).state,
+            ProbeState::Absent
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let root_can_read_anything = std::fs::read_dir(&locked).is_ok();
+        let outcome = scan_dirs("bash", std::slice::from_ref(&locked));
+        // Restore before asserting, so a failure still cleans up.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if root_can_read_anything {
+            eprintln!("skipping the unreadable branch: this user can read anything");
+        } else {
+            assert_eq!(
+                outcome.state,
+                ProbeState::Unreadable,
+                "a blocked directory must not read as absent"
+            );
+            assert!(outcome.path.is_none());
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An explicit path (one containing a separator) never touches PATH.
+    #[test]
+    fn explicit_paths_report_found_or_absent() {
+        let me = std::env::current_exe().expect("test binary path");
+        assert_eq!(
+            scan_one(&me).state,
+            ProbeState::Found,
+            "the test binary exists"
+        );
+        assert_eq!(
+            scan_one(Path::new("/nonexistent/unirun-probe-decoy")).state,
+            ProbeState::Absent
+        );
+    }
+
+    /// The snapshot's own consistency: a `Found` entry has a path, a non-Found
+    /// entry does not, and the coverage list is exactly the unreadable ones.
+    #[test]
+    fn probe_snapshot_is_internally_consistent() {
+        let caps = probe();
+        for (name, path, state) in caps
+            .shells
+            .iter()
+            .map(|s| (&s.name, &s.path, s.state))
+            .chain(caps.tools.iter().map(|t| (&t.name, &t.path, t.state)))
+        {
+            match state {
+                ProbeState::Found => {
+                    let p = path
+                        .as_deref()
+                        .unwrap_or_else(|| panic!("{name} is found but carries no path"));
+                    assert!(Path::new(p).is_file(), "{name} -> {p} is not a file");
+                }
+                ProbeState::Absent | ProbeState::Unreadable => assert!(
+                    path.is_none(),
+                    "{name} is {} but carries a path",
+                    state.as_str()
+                ),
+            }
+        }
+        let unreadable: Vec<String> = caps
+            .shells
+            .iter()
+            .filter(|s| s.state == ProbeState::Unreadable)
+            .map(|s| s.name.clone())
+            .chain(
+                caps.tools
+                    .iter()
+                    .filter(|t| t.state == ProbeState::Unreadable)
+                    .map(|t| t.name.clone()),
+            )
+            .collect();
+        assert_eq!(caps.unreadable, unreadable, "coverage list must match");
     }
 
     #[test]

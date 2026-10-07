@@ -558,8 +558,7 @@ fn cmd_probe(args: &[String]) -> ExitCode {
         println!("platform: {} ({})", caps.platform, caps.arch);
         println!("shells:");
         for s in &caps.shells {
-            let found = s.path.as_deref().unwrap_or("-");
-            println!("  {:<12} {}", s.name, found);
+            println!("  {:<12} {}", s.name, probe_line(&s.path, s.state));
         }
         println!(
             "timeout: {} (gnu available: {})",
@@ -568,11 +567,26 @@ fn cmd_probe(args: &[String]) -> ExitCode {
         );
         println!("tools:");
         for t in &caps.tools {
-            let found = t.path.as_deref().unwrap_or("-");
-            println!("  {:<10} {}", t.name, found);
+            println!("  {:<10} {}", t.name, probe_line(&t.path, t.state));
+        }
+        if !caps.unreadable.is_empty() {
+            println!(
+                "coverage: {} could not be checked: {}",
+                caps.unreadable.len(),
+                caps.unreadable.join(", ")
+            );
         }
     }
     ExitCode::SUCCESS
+}
+
+/// One probe line: the path when found, otherwise the state — an `unreadable`
+/// lookup must not look the same as a `absent` one.
+fn probe_line(path: &Option<String>, state: unirun::probe::ProbeState) -> String {
+    match (path, state) {
+        (Some(p), _) => p.clone(),
+        (None, s) => format!("({})", s.as_str()),
+    }
 }
 
 const RECIPE_HELP: &str = "\

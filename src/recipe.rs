@@ -400,6 +400,8 @@ fn cache_path(dir: &Path) -> PathBuf {
 fn shells_still_valid(shells: &[crate::probe::ShellInfo]) -> bool {
     shells.iter().all(|s| match &s.path {
         Some(p) => Path::new(p).is_file(),
+        // An `unreadable` shell is not evidence that it disappeared, so it must
+        // not invalidate the cache (the snapshot simply could not check it).
         None => true,
     })
 }

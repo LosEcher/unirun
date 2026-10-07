@@ -30,6 +30,7 @@ pub const FEATURE_KEYS: &[&str] = &[
     // Execution surfaces.
     "local-exec",
     "probe",
+    "probe-state", // probe distinguishes found / absent / unreadable
     "mcp",
     "mcp-cancel", // notifications/cancelled stops a running exec.*
     "acp",
