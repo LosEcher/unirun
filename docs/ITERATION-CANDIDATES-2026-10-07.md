@@ -44,7 +44,7 @@
 | A16 `transport_error` | ✅ 已完成 | 新增 `transport_error`/`transport_stderr` 字段 + taxonomy 类 `TRANSPORT`；255 需有 ssh 自身诊断证据；真实「连接被拒」集成测试 |
 | A13 `dispatched` | ✅ 已完成 | 新增 `dispatched`（只有前派发证据才为 false：spawn 失败/连接/认证/上传）；远端 255 与中途断连保守为 true；README 增「never ran vs ran and failed」节 |
 | A10 `capabilities --json` | ✅ 已完成 | 新增 `capabilities` 子命令 + MCP `exec.capabilities`（18 个稳定能力键，schema=1；`winrm` 随 feature 出现）；5 单测 + CLI/MCP 集成测试；README 增「Consumers: ask what the build can do」 |
-| A11 README 重试/unknown 语义 | ⏳ 待办 | |
+| A11 README 重试/unknown 语义 | ✅ 已完成 | README 增「Retry and "unknown" semantics」表（TRANSPORT/dispatched/TIMEOUT/ABORTED/PROCESS_UNKILLABLE/确定性类各自的处置）+「unknown = 未观测，不是失败」的口径 |
 | A5 `kill_status`/`exit_code_confidence` | ✅ 已完成 | 四态 `kill_status` + `exit_code_confidence` + taxonomy `PROCESS_UNKILLABLE`（"存活"优先于 TIMEOUT）；cmd 分支补 `exit /b %ERRORLEVEL%` 契约；真实「忽略 SIGTERM → sigkill-escalated」用例 + 状态机/置信度单测；E2E `trap '' TERM; sleep 30` 验证 |
 | A2–A4（ssh/winrm abort、MCP 取消、有界 drain） | ⏳ 待办 | |
 | A6–A8、A12（会话/探测/平台差异） | ⏳ 待办 | |

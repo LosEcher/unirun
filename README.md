@@ -379,6 +379,27 @@ and gone" are different claims:
   cmd path now appends `exit /b %ERRORLEVEL%`), so a non-zero status and every
   remote status stay `observed`.
 
+### Retry and "unknown" semantics
+
+unirun itself never retries — it reports. Retry is the caller's decision, and
+the result says what that decision may rest on:
+
+| Result | May be retried? |
+|---|---|
+| `TRANSPORT` with `dispatched: false` | yes — nothing ran |
+| `TRANSPORT` with `dispatched: true` | only if the command is idempotent |
+| `TIMEOUT`, `ABORTED` | only with an idempotency declaration: the tree was signalled, side effects may exist |
+| `PROCESS_UNKILLABLE` | no — deal with the surviving tree first |
+| `SYNTAX`, `PERMISSION`, `COMMAND_NOT_FOUND`, `DEPENDENCY_MISSING` | no — deterministic; fix the cause |
+| `NETWORK`, `COMPILE_ERROR` | per the caller's transient-failure policy |
+| `exit_code_confidence: "unknown"` | **not a failure**: the status was not observed, so a `0` is not proof of success |
+| no `error_class` with a non-zero `exit_code` | the command's own signal (`exit 42`); not evidence of a crash |
+
+"Unknown" always means *not observed*, never *failed*: `encoding:
+"utf-8-lossy"`, `exit_code_confidence: "unknown"`, `kill_status:
+"unconfirmed"` and a missing `error_class` all describe how much the result can
+be trusted, and each is paired with the field that is actually evidence.
+
 ### Performance benchmarks
 
 Library-level (criterion, `cargo bench`) on this M1 Mac — the full pipeline:
