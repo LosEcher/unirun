@@ -112,6 +112,11 @@ fi
 step "pushing main"
 git push origin main
 
+step "tagging ${tag}"
+# Annotated, and created only after main is on the remote, so a failed push
+# cannot leave a local tag pointing at a commit nobody else can see.
+git tag -a "${tag}" -m "unirun ${version}"
+
 step "pushing ${tag}"
 git push origin "${tag}"
 
