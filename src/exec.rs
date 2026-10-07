@@ -262,6 +262,8 @@ fn run_inner(
         encoding: stdout_decoded.encoding.to_string(),
         truncated: stdout_trunc || stderr_trunc,
         shell_used: shell,
+        transport_error: false,
+        transport_stderr: None,
     };
     let recipe_maps = if spec.error_maps.is_empty() {
         None

@@ -212,10 +212,7 @@ fn ssh_powershell(target: &SshTarget, script: &str) -> ExecResult {
         bytes.extend_from_slice(payload.as_bytes());
         let uploaded = upload_scp(target, &remote_path, &bytes);
         if let Err(e) = uploaded {
-            let mut r = ExecResult::success(String::new(), format!("upload failed: {}", e), exe);
-            r.error_class = Some("COMMAND_NOT_FOUND".into());
-            r.hint = Some("scp to the remote host failed; check host/credentials".into());
-            return r;
+            return upload_failed(exe, e);
         }
         let remote_cmd = format!(
             "{} -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {}",
@@ -232,10 +229,7 @@ fn ssh_powershell(target: &SshTarget, script: &str) -> ExecResult {
 fn ssh_cmd_file(target: &SshTarget, script: &str) -> ExecResult {
     let remote_path = format!(r"C:\Windows\Temp\unirun-{}.bat", nonce());
     if let Err(e) = upload_scp(target, &remote_path, script.as_bytes()) {
-        let mut r = ExecResult::success(String::new(), format!("upload failed: {}", e), "cmd");
-        r.error_class = Some("COMMAND_NOT_FOUND".into());
-        r.hint = Some("scp to the remote host failed; check host/credentials".into());
-        return r;
+        return upload_failed("cmd", e);
     }
     let remote_cmd = format!("cmd.exe /C \"{}\"", remote_path);
     let r = run_ssh(target, &remote_cmd, None);
@@ -375,6 +369,18 @@ fn assemble_ssh_result(
     let stdout = crate::encoding::normalize_line_endings(&stdout_decoded.text);
     let stderr = crate::encoding::normalize_line_endings(&stderr_decoded.text);
 
+    // ssh reports its own failures with status 255; when its diagnostics are
+    // present, the command never produced a result. Anything else is a remote
+    // failure that happens to share the code.
+    let (stderr, transport_stderr, transport_error) =
+        if exit_code == Some(SSH_CLIENT_FAILURE) && !timed_out {
+            let (remote, transport) = split_transport_diagnostics(&stderr);
+            let transport_error = transport.is_some();
+            (remote, transport, transport_error)
+        } else {
+            (stderr, None, false)
+        };
+
     let mut result = ExecResult {
         exit_code,
         signal: None,
@@ -388,6 +394,8 @@ fn assemble_ssh_result(
         encoding: stdout_decoded.encoding.to_string(),
         truncated: stdout_capture.truncated || stderr_capture.truncated,
         shell_used: target.shell.as_str().to_string(),
+        transport_error,
+        transport_stderr,
     };
     let (class, hint) = classify(&result);
     result.error_class = class;
@@ -499,6 +507,18 @@ fn nonce() -> String {
     )
 }
 
+/// A failed scp upload means the remote command never ran: report it as a
+/// transport error, not as a missing command on the remote host.
+fn upload_failed(shell_used: &str, e: std::io::Error) -> ExecResult {
+    let mut r = ExecResult::success(String::new(), String::new(), shell_used);
+    r.exit_code = None;
+    r.transport_error = true;
+    r.transport_stderr = Some(format!("upload failed: {}", e));
+    r.error_class = Some("TRANSPORT".into());
+    r.hint = Some("scp to the remote host failed; check host/credentials".into());
+    r
+}
+
 /// Strip the Win32-OpenSSH post-quantum banner from stderr.
 fn filter_banner(data: &[u8]) -> Vec<u8> {
     let text = String::from_utf8_lossy(data);
@@ -564,6 +584,63 @@ fn kill_ssh_tree(child: &Child, _grace: Duration) {
         .stderr(Stdio::null())
         .status();
 }
+
+/// Lines the `ssh`/`scp` clients write about *themselves*. Matching one of
+/// these (with ssh's own exit status 255) means the transport failed before the
+/// remote command produced a result.
+///
+/// Deliberately narrow: `connect to host … Connection refused` is a curl
+/// message too, and a remote script that exits 255 while printing it must stay
+/// a remote failure. The prefixes below are the ssh client's own vocabulary.
+const TRANSPORT_DIAGNOSTIC_PREFIXES: &[&str] = &[
+    "ssh: ",
+    "scp: ",
+    "kex_exchange_identification:",
+    "ssh_exchange_identification:",
+    "channel 0: open failed:",
+    "connection closed by ",
+    "received disconnect from ",
+    "host key verification failed",
+    "permission denied (",
+    "too many authentication failures",
+    "no matching host key type found",
+    "remote host identification has changed",
+    "banner exchange: ",
+];
+
+/// Split the ssh client's own diagnostics out of the captured stderr.
+///
+/// Returns `(remote_stderr, transport_stderr)`. Only consulted when the ssh
+/// child exited 255 — the client's own failure status.
+fn split_transport_diagnostics(stderr: &str) -> (String, Option<String>) {
+    let mut remote = String::new();
+    let mut transport = String::new();
+    for line in stderr.lines() {
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_lowercase();
+        if TRANSPORT_DIAGNOSTIC_PREFIXES
+            .iter()
+            .any(|p| lower.starts_with(p))
+        {
+            transport.push_str(line);
+            transport.push('\n');
+        } else {
+            remote.push_str(line);
+            remote.push('\n');
+        }
+    }
+    let transport = if transport.is_empty() {
+        None
+    } else {
+        Some(transport)
+    };
+    (remote, transport)
+}
+
+/// `ssh` reserves exit status 255 for its own failures (`ExitOnForwardFailure`
+/// and friends aside, a remote command cannot produce it through `ssh` without
+/// the client having reported the error first).
+const SSH_CLIENT_FAILURE: i32 = 255;
 
 #[cfg(test)]
 mod tests {
@@ -647,6 +724,125 @@ mod tests {
         assert!(r.timed_out);
         assert_eq!(r.exit_code, None);
         assert_eq!(r.shell_used, "bash");
+    }
+
+    /// ssh reports its own failures with status 255; its diagnostics are the
+    /// evidence that the command never ran. They are split out of `stderr` so
+    /// the remote's output stays readable, and the result is flagged
+    /// `transport_error`.
+    #[test]
+    fn ssh_client_diagnostics_are_split_and_flagged() {
+        let t = target();
+        let r = assemble_ssh_result(
+            &t,
+            Some(255),
+            false,
+            capture(b"", false),
+            capture(
+                b"ssh: connect to host h.example port 22: Connection refused\n",
+                false,
+            ),
+            4,
+        );
+        assert!(
+            r.transport_error,
+            "255 + ssh diagnostic must be a transport failure"
+        );
+        assert_eq!(r.stderr, "");
+        assert_eq!(
+            r.transport_stderr.as_deref(),
+            Some("ssh: connect to host h.example port 22: Connection refused\n")
+        );
+        assert_eq!(r.error_class.as_deref(), Some("TRANSPORT"));
+
+        // Auth failure: ssh's `Permission denied (…)` line, no `ssh:` prefix.
+        let auth = assemble_ssh_result(
+            &t,
+            Some(255),
+            false,
+            capture(b"", false),
+            capture(b"Permission denied (publickey).\n", false),
+            4,
+        );
+        assert!(auth.transport_error);
+        assert!(auth.transport_stderr.is_some());
+    }
+
+    /// A remote script that exits 255 itself stays a remote failure: same exit
+    /// code, but the stderr is not the ssh client talking about itself. A curl
+    /// "Connection refused" must not be mistaken for a transport error either.
+    #[test]
+    fn remote_exit_255_is_not_a_transport_error() {
+        let t = target();
+        let r = assemble_ssh_result(
+            &t,
+            Some(255),
+            false,
+            capture(b"", false),
+            capture(
+                b"Failed to connect to db port 5432: Connection refused\n",
+                false,
+            ),
+            4,
+        );
+        assert!(
+            !r.transport_error,
+            "remote stderr must not be read as the ssh client's own failure"
+        );
+        assert!(r.transport_stderr.is_none());
+        assert_eq!(
+            r.stderr,
+            "Failed to connect to db port 5432: Connection refused\n"
+        );
+
+        // Mixed: the client's line is split out, the remote's line stays.
+        let mixed = assemble_ssh_result(
+            &t,
+            Some(255),
+            false,
+            capture(b"", false),
+            capture(
+                b"remote warning\nssh: connect to host h port 22: timed out\n",
+                false,
+            ),
+            4,
+        );
+        assert!(mixed.transport_error);
+        assert_eq!(mixed.stderr, "remote warning\n");
+        assert_eq!(
+            mixed.transport_stderr.as_deref(),
+            Some("ssh: connect to host h port 22: timed out\n")
+        );
+    }
+
+    /// A timed-out run keeps its diagnostics in `stderr`: the timeout explains
+    /// itself, and re-labelling it as a transport error would hide that.
+    #[test]
+    fn timed_out_runs_are_not_transport_errors() {
+        let t = target();
+        let r = assemble_ssh_result(
+            &t,
+            Some(255),
+            true,
+            capture(b"", false),
+            capture(b"ssh: connect to host h port 22: timed out\n", false),
+            4,
+        );
+        assert!(!r.transport_error);
+        assert!(r.transport_stderr.is_none());
+    }
+
+    #[test]
+    fn upload_failures_are_transport_errors() {
+        let r = upload_failed("cmd", std::io::Error::other("scp exited non-zero"));
+        assert!(r.transport_error);
+        assert_eq!(r.exit_code, None);
+        assert_eq!(r.error_class.as_deref(), Some("TRANSPORT"));
+        assert!(r
+            .transport_stderr
+            .as_deref()
+            .unwrap_or("")
+            .contains("scp exited non-zero"));
     }
 
     /// The cap must actually bound the reader: 8 KiB chunks, tail kept.

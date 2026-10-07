@@ -307,6 +307,7 @@ result (including `exit_code` and `error_class`) is in the JSON.
 | `DEPENDENCY_MISSING` | ModuleNotFoundError and friends                 |
 | `SYNTAX`             | shell syntax error                              |
 | `NETWORK`            | unreachable host / repo / registry (P2)         |
+| `TRANSPORT`          | ssh/scp/winrm failed *before* the command ran (connect, auth, host key, DNS, upload) — the `transport_error` flag, with the client's own diagnostics in `transport_stderr` |
 | `COMPILE_ERROR`      | compiler/toolchain diagnostics (P2)             |
 | `UNKNOWN_FAILURE`    | non-zero exit with unrecognized stderr          |
 | *(none)*             | success, or explicit non-zero exit w/o evidence |

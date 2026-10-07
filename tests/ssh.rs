@@ -22,6 +22,50 @@ fn target(shell: Shell) -> SshTarget {
     }
 }
 
+/// The local ssh client's own failure must be labelled `TRANSPORT` and split
+/// out of `stderr`, so a caller can tell "never ran" from "the remote exited
+/// 255". Uses a port nothing listens on: no host, no credentials, no network.
+/// Skipped when there is no ssh binary.
+#[test]
+fn ssh_transport_failure_is_classified() {
+    if std::process::Command::new("ssh")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: no ssh binary on PATH");
+        return;
+    }
+    let t = SshTarget {
+        host: "127.0.0.1".into(),
+        port: Some(1),
+        connect_timeout: 3,
+        timeout_ms: 10_000,
+        ..Default::default()
+    };
+    let r = ssh_run(&t, "echo hi");
+    assert!(
+        r.transport_error,
+        "a refused connection is a transport failure: {:?}",
+        r
+    );
+    assert_eq!(r.error_class.as_deref(), Some("TRANSPORT"));
+    assert!(
+        r.transport_stderr
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("ssh"),
+        "the client's own diagnostic must be preserved: {:?}",
+        r.transport_stderr
+    );
+    assert!(
+        !r.stderr.to_lowercase().contains("ssh:"),
+        "the client's diagnostic must not stay in the remote stderr: {:?}",
+        r.stderr
+    );
+}
+
 /// Unix remote target; host from `UNIRUN_TEST_SSH_HOST`, user/port/identity
 /// from `UNIRUN_TEST_SSH_USER` / `UNIRUN_TEST_SSH_PORT` / `UNIRUN_TEST_SSH_IDENTITY`.
 fn unix_target(shell: Shell) -> SshTarget {

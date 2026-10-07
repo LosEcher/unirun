@@ -180,6 +180,15 @@ pub struct ExecResult {
     pub truncated: bool,
     /// Shell actually used (after resolution/fallback).
     pub shell_used: String,
+    /// True when the **transport** failed before the command could produce a
+    /// result — ssh connect/auth/host-key/DNS problems, a failed scp upload, a
+    /// WinRM client or PSRP failure. This is the "never ran" signal a caller
+    /// needs before retrying a non-idempotent command; a remote script that
+    /// itself exits 255 is *not* a transport error.
+    pub transport_error: bool,
+    /// The transport client's own diagnostic lines, split out of `stderr` so
+    /// the remote's output stays readable. `None` when there were none.
+    pub transport_stderr: Option<String>,
 }
 
 impl ExecResult {
@@ -197,6 +206,8 @@ impl ExecResult {
             encoding: "utf-8".to_string(),
             truncated: false,
             shell_used: shell_used.to_string(),
+            transport_error: false,
+            transport_stderr: None,
         }
     }
 }

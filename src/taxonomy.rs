@@ -7,6 +7,12 @@
 //!   TIMEOUT · ABORTED · COMMAND_NOT_FOUND · PERMISSION · EXEC_FORMAT
 //!   NOT_FOUND · DEPENDENCY_MISSING · SYNTAX · UNKNOWN_FAILURE
 //!   NETWORK · COMPILE_ERROR          (added with the P2 error-map library)
+//!   TRANSPORT                        (the transport failed before the command
+//!                                    ran: ssh connect/auth/host-key/DNS, a
+//!                                    failed scp upload, a WinRM/PSRP failure.
+//!                                    Structural — set from
+//!                                    `ExecResult::transport_error`, never
+//!                                    inferred from output)
 //!   PID_REUSED                       (kill refused — the pid no longer refers
 //!                                    to the process we started; set by the
 //!                                    background-session kill path, which
@@ -57,6 +63,17 @@ pub fn classify_with_maps(
             Some("ABORTED".into()),
             Some(
                 "the run was cancelled by the caller; no partial state was committed by unirun"
+                    .into(),
+            ),
+        );
+    }
+    // Structural, and ahead of every stderr pattern: the transport failed, so
+    // the command never produced a result and no output evidence exists.
+    if r.transport_error {
+        return (
+            Some("TRANSPORT".into()),
+            Some(
+                "the transport (ssh/scp/winrm) failed before the command ran; the remote command produced no result — retrying the submission is safe, retrying a partly-executed command is not"
                     .into(),
             ),
         );
@@ -124,6 +141,30 @@ mod tests {
     #[test]
     fn success_is_none() {
         assert_eq!(classify(&base()), (None, None));
+    }
+
+    #[test]
+    fn transport_error_class_is_structural() {
+        // Set from the transport, never inferred from stderr text: a remote
+        // script that exits 255 while printing a connection error stays
+        // whatever its own evidence says.
+        let mut r = base();
+        r.exit_code = Some(255);
+        r.transport_error = true;
+        r.transport_stderr = Some("ssh: connect to host x port 22: Connection refused\n".into());
+        let (class, hint) = classify(&r);
+        assert_eq!(class.as_deref(), Some("TRANSPORT"));
+        let hint = hint.unwrap_or_default();
+        assert!(
+            hint.contains("never ran") || hint.contains("produced no result"),
+            "the hint must say the command did not run: {hint}"
+        );
+
+        // Without the flag, the same shape is not a transport error.
+        let mut plain = base();
+        plain.exit_code = Some(255);
+        plain.stderr = "some remote failure\n".into();
+        assert_eq!(classify(&plain).0.as_deref(), Some("UNKNOWN_FAILURE"));
     }
 
     #[test]

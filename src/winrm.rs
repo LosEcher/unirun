@@ -158,6 +158,8 @@ pub fn winrm_run(target: &WinrmTarget, script: &str) -> ExecResult {
                 encoding: "utf-8".to_string(),
                 truncated: out_truncated || err_truncated,
                 shell_used: shell_used.to_string(),
+                transport_error: false,
+                transport_stderr: None,
             }
         }
         Err(e) => return err_result(format!("winrm/psrp error: {}", e), start, target),
@@ -168,10 +170,14 @@ pub fn winrm_run(target: &WinrmTarget, script: &str) -> ExecResult {
     r
 }
 
+/// Build the result for a transport-level WinRM failure: the command never ran,
+/// which is exactly what `transport_error` tells the caller.
 fn err_result(message: String, start: Instant, target: &WinrmTarget) -> ExecResult {
-    let mut r = ExecResult::success(String::new(), message, "winrm");
+    let mut r = ExecResult::success(String::new(), String::new(), "winrm");
     r.exit_code = None;
-    r.error_class = Some("COMMAND_NOT_FOUND".into());
+    r.transport_error = true;
+    r.transport_stderr = Some(message);
+    r.error_class = Some("TRANSPORT".into());
     r.hint = Some(format!(
         "WinRM connection to {}:{} failed; check host, port, auth, and that WinRM is enabled",
         target.host, target.port
