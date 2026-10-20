@@ -1,53 +1,60 @@
 #!/usr/bin/env bash
 #
-# Miri gate for unirun's *syscall-free pure core*.
+# Miri gate for a repository's *syscall-free pure core*.
 #
-# Why only a subset: Miri cannot execute FFI or real syscalls, so `exec`,
-# `process_identity`, `transport`, `session` are out of scope by construction —
-# they spawn processes, read /proc, or call libc. The modules targeted here are
-# pure data transforms (`encoding`, `coalesce`, `taxonomy`): bytes in, decisions
-# out, no clock, no filesystem, no environment. That is the whole point of the
-# split — a small core that a machine can prove, and a thin shell around it that
-# only integration tests can judge.
+# Canonical source: <dsfolder>/scripts/miri-pure-core/miri-pure-core.sh
+# Installed copy:   <repo>/scripts/miri-pure-core.sh
+# Repo-owned config: <repo>/scripts/miri-pure-core.conf
 #
-# This gate is deliberately *not* a "run everything" wrapper. It runs a filter
-# list, and it fails when the filter list stops matching enough tests (see
-# MIN_PASSED), because a gate that silently matches zero tests is indistinguishable
-# from a passing one. The other half of that discipline is `--self-test`, which
-# injects real undefined behaviour into throwaway crates and requires Miri to
-# report it — a green Miri run proves nothing if the harness cannot go red.
+# Why a subset and not the whole crate: Miri cannot execute FFI or real
+# syscalls, so anything that spawns a process, reads /proc, opens a socket or
+# touches the filesystem is out of scope by construction. What is left is the
+# part a machine can actually prove — pure data transforms and decision logic
+# (parsers, policy matching, budget arithmetic, serialization invariants). The
+# shell around it stays covered by integration tests and real-machine acceptance.
+#
+# The engine is identical in every repo; only the conf differs (filters, test
+# floor, target). `install.sh --check` compares the installed engine's hash
+# against this file, so the copies cannot silently diverge.
 #
 # Exit codes (three states, never collapsed):
-#   0  pass             — Miri ran the pure core, no UB, test floor met
+#   0  pass             — Miri ran the filters, no UB, test floor met
 #   1  fail             — UB found, a test failed, or the floor was not met
-#   2  inconclusive     — could not judge (no Miri, no sysroot, unknown failure)
+#   2  inconclusive     — could not judge (no Miri, no sysroot, no config, ...)
 #
-# Exit 2 is *not* a pass. A caller that treats it as one has rebuilt the
-# "environment failure disguised as a product defect" bug this repo already
-# paid for once (2026-10-08: `cargo: command not found` recorded as "real drift").
+# Exit 2 is *not* a pass. A caller that treats it as one rebuilds the
+# "environment failure disguised as a product defect" bug this workspace already
+# paid for once (2026-10-08: `cargo: command not found` recorded as drift).
 #
 # Usage:
 #   scripts/miri-pure-core.sh              # the gate
-#   scripts/miri-pure-core.sh --self-test  # negative/positive controls for the judge
-#   scripts/miri-pure-core.sh --print      # show the resolved toolchain/sysroot/filters
+#   scripts/miri-pure-core.sh --self-test  # positive/negative controls of the judge
+#   scripts/miri-pure-core.sh --print      # resolved config (conf path, filters, floor)
 #
-# Environment (all optional; every default is resolved by contract, not by hoping
-# the caller's shell is configured):
+# Environment overrides (all optional):
 #   CARGO              cargo to use (default: PATH, then ~/.cargo/bin, then Homebrew)
-#   MIRI_TOOLCHAIN     rustup toolchain for Miri (default: nightly)
-#   MIRI_SYSROOT       prebuilt Miri sysroot (default: the cargo-miri cache if present)
-#   MIRIFLAGS          Miri flags (default: -Zmiri-tree-borrows)
-#   MIRI_MIN_PASSED    test floor (default: 34 — raise it when you add tests)
+#   MIRI_CONF          path to the conf (default: <repo>/scripts/miri-pure-core.conf)
+#   MIRI_TOOLCHAIN     rustup toolchain for Miri (default from conf, else nightly)
+#   MIRI_SYSROOT       prebuilt Miri sysroot (default: search the known caches)
+#   MIRIFLAGS          Miri flags (default from conf, else -Zmiri-tree-borrows)
+#   MIRI_MIN_PASSED    test floor (default from conf)
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TOOLCHAIN="${MIRI_TOOLCHAIN:-nightly}"
-FILTERS=(encoding:: coalesce:: taxonomy::)
-MIN_PASSED="${MIRI_MIN_PASSED:-34}"
-MIRI_FLAGS="${MIRIFLAGS:--Zmiri-tree-borrows}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONF="${MIRI_CONF:-$SCRIPT_DIR/miri-pure-core.conf}"
 
 say() { printf '%s\n' "$*"; }
+
+inconclusive() {
+    local reason="$1"
+    shift
+    say "miri-pure-core: verdict=inconclusive reason=$reason"
+    local line
+    for line in "$@"; do say "  $line"; done
+    exit 2
+}
 
 # --- capability probing ----------------------------------------------------
 # Never `command -v cargo` alone: a launchd/CI shell can have a PATH without
@@ -79,6 +86,41 @@ resolve_sysroot() {
     return 1
 }
 
+# --- repo-owned config -----------------------------------------------------
+# The conf is the only thing that differs per repo. It is sourced, so it can
+# express arrays, and it is validated below: an installed engine with no conf
+# must not guess what to run.
+MIRI_FILTERS=()
+MIRI_MIN_PASSED=""
+MIRI_TARGET="bins"
+MIRI_TOOLCHAIN="nightly"
+MIRI_FLAGS="-Zmiri-tree-borrows"
+
+load_conf() {
+    [ -f "$CONF" ] || inconclusive "no-config" \
+        "expected $CONF" \
+        "an installed gate without a conf would have to guess its filters, and a wrong guess runs the wrong tests silently"
+    # shellcheck disable=SC1090
+    . "$CONF" || inconclusive "config-unreadable" "failed to source $CONF"
+    if [ "${#MIRI_FILTERS[@]}" -eq 0 ]; then
+        inconclusive "config-empty-filters" \
+            "$CONF declares no MIRI_FILTERS" \
+            "empty filters make libtest run every test in the target, including ones that need syscalls"
+    fi
+    case "$MIRI_MIN_PASSED" in
+    '' | *[!0-9]*) inconclusive "config-bad-floor" "MIRI_MIN_PASSED must be a positive integer, got '$MIRI_MIN_PASSED'" ;;
+    esac
+    if [ "$MIRI_MIN_PASSED" -lt 1 ]; then
+        inconclusive "config-bad-floor" "MIRI_MIN_PASSED must be >= 1, got $MIRI_MIN_PASSED"
+    fi
+    case "$MIRI_TARGET" in
+    lib) MIRI_TARGET_FLAG="--lib" ;;
+    bins) MIRI_TARGET_FLAG="--bins" ;;
+    all) MIRI_TARGET_FLAG="" ;;
+    *) inconclusive "config-bad-target" "MIRI_TARGET must be lib|bins|all, got '$MIRI_TARGET'" ;;
+    esac
+}
+
 # `#[cfg(miri)]` / `cfg!(miri)` branches are how a gate turns into "green but
 # untested": code that only exists under Miri never runs in production, and code
 # that vanishes under Miri hides the very paths the gate claims to prove.
@@ -98,14 +140,10 @@ scan_ub_holes() {
 # ordering matters: UB text wins, then an explicit libtest failure, then a
 # non-zero exit (a non-zero exit must never be readable as a pass just because
 # the log happens to contain a happy "test result" line), and only then the
-# counts — including the "no result line at all" case, which is exit 2, not 0.
+# counts — including "no result line at all", which is exit 2, not 0.
 # judge <log> <rc> [floor] → "<code> <verdict> <reason>"
-# The floor defaults to the repo's MIN_PASSED; throwaway control crates pass their
-# own (they contain one test, not the repo's 34). Getting that wrong once made the
-# "clean crate must come back green" control read as a failure — an instrument bug
-# that would have been mistaken for a product bug.
 judge() {
-    local log="$1" rc="$2" floor="${3:-$MIN_PASSED}" passed failed
+    local log="$1" rc="$2" floor="${3:-${MIRI_MIN_PASSED:-1}}" passed failed
     if grep -q 'Undefined Behavior' "$log" 2>/dev/null; then
         printf '1 ub undefined-behavior'
         return 0
@@ -143,20 +181,19 @@ print_config() {
     cargo="$(resolve_cargo || true)"
     sysroot="$(resolve_sysroot || true)"
     say "repo=$REPO_ROOT"
+    say "conf=$CONF"
     say "cargo=${cargo:-<not found>}"
-    say "toolchain=+$TOOLCHAIN"
+    say "toolchain=+$MIRI_TOOLCHAIN"
+    say "target=$MIRI_TARGET"
     say "miri_flags=$MIRI_FLAGS"
     say "sysroot=${sysroot:-<unset: cargo-miri will run its own setup>}"
-    say "filters=${FILTERS[*]}"
-    say "min_passed=$MIN_PASSED"
+    say "filters=${MIRI_FILTERS[*]}"
+    say "min_passed=$MIRI_MIN_PASSED"
 }
 
 self_test() {
-    local tmp log code verdict reason failures=0 checks=0 expect got
-    tmp="$(mktemp -d "${TMPDIR:-/tmp}/miri-self-test.XXXXXX")" || {
-        say 'miri-pure-core: verdict=inconclusive reason=no-temp-dir'
-        exit 2
-    }
+    local tmp log code got failures=0 checks=0 expect
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/miri-self-test.XXXXXX")" || inconclusive "no-temp-dir"
     # shellcheck disable=SC2064
     trap "rm -rf '$tmp'" EXIT
 
@@ -177,16 +214,13 @@ self_test() {
     printf 'error: Undefined Behavior: memory access failed\n' >"$tmp/ub.log"
     expect_case 'undefined behaviour is a failure' "$tmp/ub.log" 1 '1 ub undefined-behavior'
 
-    printf 'test result: FAILED. 33 passed; 1 failed; 0 ignored\n' >"$tmp/failed.log"
+    printf 'test result: FAILED. 3 passed; 1 failed; 0 ignored\n' >"$tmp/failed.log"
     expect_case 'libtest failure is a failure' "$tmp/failed.log" 1 '1 fail test-failed'
 
-    printf 'test result: ok. 34 passed; 0 failed; 0 ignored\n' >"$tmp/ok.log"
+    printf 'test result: ok. %s passed; 0 failed; 0 ignored\n' "$MIRI_MIN_PASSED" >"$tmp/ok.log"
     expect_case 'floor met is a pass' "$tmp/ok.log" 0 '0 pass ok'
 
-    printf 'test result: ok. 16 passed; 0 failed; 0 ignored\n' >"$tmp/floor.log"
-    expect_case 'below floor is a failure' "$tmp/floor.log" 0 '1 fail below-floor-16-of-34'
-
-    # The control this script exists for: an empty log with a zero exit code.
+    # The control this engine exists for: an empty log with a zero exit code.
     # Treating that as a pass is how a gate stops measuring anything.
     : >"$tmp/empty.log"
     expect_case 'empty log is not a pass' "$tmp/empty.log" 0 '2 inconclusive no-test-result-line'
@@ -197,19 +231,23 @@ self_test() {
     printf 'error: no such command: `miri`\n' >"$tmp/nomiri.log"
     expect_case 'missing miri is inconclusive' "$tmp/nomiri.log" 101 '2 inconclusive exit-rc101'
 
+    # Below floor, derived from the actual floor so the case survives a repo
+    # with a different test count.
+    local below=$((MIRI_MIN_PASSED - 1))
+    if [ "$below" -lt 0 ]; then below=0; fi
+    printf 'test result: ok. %s passed; 0 failed; 0 ignored\n' "$below" >"$tmp/floor.log"
+    expect_case 'below floor is a failure' "$tmp/floor.log" 0 \
+        "1 fail below-floor-$below-of-$MIRI_MIN_PASSED"
+
     say 'miri-pure-core: self-test — real Miri on throwaway crates'
     local cargo sysroot
-    cargo="$(resolve_cargo)" || {
-        say 'miri-pure-core: verdict=inconclusive reason=cargo-not-found'
-        exit 2
-    }
+    cargo="$(resolve_cargo)" || inconclusive "cargo-not-found" \
+        "probed: \$CARGO, PATH, ~/.cargo/bin, /opt/homebrew/bin, /usr/local/bin"
     sysroot="$(resolve_sysroot || true)"
     [ -n "$sysroot" ] && export MIRI_SYSROOT="$sysroot"
-    if ! "$cargo" "+$TOOLCHAIN" miri --version >"$tmp/version.log" 2>&1; then
-        say 'miri-pure-core: verdict=inconclusive reason=miri-not-installed'
-        sed -n '1,5p' "$tmp/version.log"
-        say "  remediation: rustup +$TOOLCHAIN component add miri && $cargo +$TOOLCHAIN miri setup"
-        exit 2
+    if ! "$cargo" "+$MIRI_TOOLCHAIN" miri --version >"$tmp/version.log" 2>&1; then
+        inconclusive "miri-not-installed" \
+            "remediation: rustup +$MIRI_TOOLCHAIN component add miri && $cargo +$MIRI_TOOLCHAIN miri setup"
     fi
     say "  miri: $(tail -1 "$tmp/version.log")"
 
@@ -228,7 +266,7 @@ mod t {
     }
 }
 RS
-    ( cd "$tmp/clean" && MIRIFLAGS="$MIRI_FLAGS" "$cargo" "+$TOOLCHAIN" miri test --lib ) \
+    ( cd "$tmp/clean" && MIRIFLAGS="$MIRI_FLAGS" "$cargo" "+$MIRI_TOOLCHAIN" miri test --lib ) \
         >"$tmp/clean.log" 2>&1
     code=$?
     got="$(judge "$tmp/clean.log" "$code" 1)"
@@ -236,7 +274,7 @@ RS
         say "  ok   clean crate -> $got"
     else
         say "  FAIL clean crate -> $got (a Miri that cannot go green cannot be trusted to go red)"
-        sed -n '$p' "$tmp/clean.log"
+        tail -3 "$tmp/clean.log"
         failures=$((failures + 1))
     fi
 
@@ -255,16 +293,17 @@ mod t {
     }
 }
 RS
-    ( cd "$tmp/ub" && MIRIFLAGS="$MIRI_FLAGS" "$cargo" "+$TOOLCHAIN" miri test --lib ) \
+    ( cd "$tmp/ub" && MIRIFLAGS="$MIRI_FLAGS" "$cargo" "+$MIRI_TOOLCHAIN" miri test --lib ) \
         >"$tmp/ub-run.log" 2>&1
     code=$?
     got="$(judge "$tmp/ub-run.log" "$code" 1)"
-    if [ "${got%% *}" = '1' ] && case "$got" in *undefined-behavior*) true ;; *) false ;; esac; then
-        say "  ok   injected UB -> $got"
-    else
+    case "$got" in
+    1\ ub\ undefined-behavior*) say "  ok   injected UB -> $got" ;;
+    *)
         say "  FAIL injected UB -> $got (expected '1 ub undefined-behavior')"
         failures=$((failures + 1))
-    fi
+        ;;
+    esac
 
     checks=$((checks + 1))
     if scan_ub_holes >"$tmp/holes.log" 2>&1; then
@@ -286,53 +325,56 @@ RS
 # --- main ------------------------------------------------------------------
 case "${1:-}" in
 --print)
+    load_conf
     print_config
     exit 0
     ;;
 --self-test)
+    load_conf
     self_test
     ;;
 '')
+    load_conf
     ;;
 *)
-    say "miri-pure-core: verdict=inconclusive reason=unknown-argument-$1"
-    exit 2
+    inconclusive "unknown-argument" "got '$1'; expected no argument, --print or --self-test"
     ;;
 esac
 
-cargo_bin="$(resolve_cargo)" || {
-    say 'miri-pure-core: verdict=inconclusive reason=cargo-not-found'
-    say '  probed: $CARGO, PATH, ~/.cargo/bin, /opt/homebrew/bin, /usr/local/bin'
-    exit 2
-}
+if ! cargo_bin="$(resolve_cargo)"; then
+    inconclusive "cargo-not-found" \
+        "probed: \$CARGO, PATH, ~/.cargo/bin, /opt/homebrew/bin, /usr/local/bin"
+fi
 
-if [ -n "$(resolve_sysroot || true)" ]; then
-    export MIRI_SYSROOT="$(resolve_sysroot)"
+if sysroot="$(resolve_sysroot)"; then
+    export MIRI_SYSROOT="$sysroot"
 else
     say 'miri-pure-core: note: no prebuilt Miri sysroot found; cargo-miri will build one (needs rust-src)'
 fi
 export MIRIFLAGS="$MIRI_FLAGS"
 
-if ! "$cargo_bin" "+$TOOLCHAIN" miri --version >/dev/null 2>&1; then
-    say 'miri-pure-core: verdict=inconclusive reason=miri-not-installed'
-    say "  remediation: rustup +$TOOLCHAIN component add miri && $cargo_bin +$TOOLCHAIN miri setup"
-    exit 2
+if ! "$cargo_bin" "+$MIRI_TOOLCHAIN" miri --version >/dev/null 2>&1; then
+    inconclusive "miri-not-installed" \
+        "remediation: rustup +$MIRI_TOOLCHAIN component add miri && $cargo_bin +$MIRI_TOOLCHAIN miri setup"
 fi
 
-if ! scan_ub_holes >/tmp/miri-pure-core-holes.$$ 2>&1; then
+holes_file="$(mktemp "${TMPDIR:-/tmp}/miri-holes.XXXXXX")"
+if ! scan_ub_holes >"$holes_file" 2>&1; then
     say 'miri-pure-core: verdict=fail reason=cfg-miri-escape-hole'
     say '  a #[cfg(miri)] branch means the gate proves a different program than the one that ships'
-    sed -n '1,10p' /tmp/miri-pure-core-holes.$$
-    rm -f /tmp/miri-pure-core-holes.$$
+    sed -n '1,10p' "$holes_file"
+    rm -f "$holes_file"
     exit 1
 fi
-rm -f /tmp/miri-pure-core-holes.$$
+rm -f "$holes_file"
 
 log="$(mktemp "${TMPDIR:-/tmp}/miri-pure-core.XXXXXX")"
 trap 'rm -f "$log"' EXIT
 
-say "miri-pure-core: running filters: ${FILTERS[*]} (min_passed=$MIN_PASSED, flags=$MIRIFLAGS)"
-( cd "$REPO_ROOT" && "$cargo_bin" "+$TOOLCHAIN" miri test --lib -- "${FILTERS[@]}" ) >"$log" 2>&1
+say "miri-pure-core: filters: ${MIRI_FILTERS[*]} (target=$MIRI_TARGET, min_passed=$MIRI_MIN_PASSED, flags=$MIRIFLAGS)"
+target_args=()
+[ -n "$MIRI_TARGET_FLAG" ] && target_args=("$MIRI_TARGET_FLAG")
+( cd "$REPO_ROOT" && "$cargo_bin" "+$MIRI_TOOLCHAIN" miri test "${target_args[@]}" -- "${MIRI_FILTERS[@]}" ) >"$log" 2>&1
 rc=$?
 
 read -r code verdict reason <<<"$(judge "$log" "$rc")"
@@ -340,7 +382,7 @@ read -r code verdict reason <<<"$(judge "$log" "$rc")"
 case "$code" in
 0)
     passed="$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed.*/\1/p' "$log" | tail -1)"
-    say "miri-pure-core: verdict=pass passed=$passed floor=$MIN_PASSED"
+    say "miri-pure-core: verdict=pass passed=$passed floor=$MIRI_MIN_PASSED"
     ;;
 1)
     say "miri-pure-core: verdict=fail reason=$verdict/$reason"
