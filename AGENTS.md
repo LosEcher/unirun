@@ -52,6 +52,27 @@ cargo fmt --check                       # 红 = scope 外有债：整文件 carg
 每次运行追加写入 `.fmtguard/runs.jsonl`（已加入 `.gitignore`，不入库）。
 审计/回放：`fmtguard replay <run_id> --emit json|patch`（run_id 来自 `--emit json` 输出的 `run_id`）。
 
+## 改「纯核心」后：Miri 门禁（必须）
+
+`encoding` / `coalesce` / `taxonomy` 是无系统调用、无时钟、无文件系统的纯数据变换，
+因此是**唯一能被机器证明**的部分（Miri 过不了 FFI 与真实 syscall）。改动它们后跑：
+
+```sh
+bash scripts/miri-pure-core.sh              # 0=pass  1=fail（含 UB / 低于测试下限）  2=判不了
+bash scripts/miri-pure-core.sh --self-test  # 门禁自检：注入 UB 必须报红，干净 crate 必须绿
+```
+
+三条不可让步的语义：
+
+- **`2` 不是通过**。找不到 Miri / 没有 sysroot / 输出无法解析一律 `2`，调用方不得当绿。
+- **测试数下限（`MIRI_MIN_PASSED`，当前 34）是判据的一部分**。filter 匹配不到测试时的
+  "0 passed" 与"真的都过了"必须可区分；新增纯核心测试后同步抬高下限。
+- **禁止 `#[cfg(miri)]` 分支**（门禁会 grep 并在命中时直接失败）：它会让门禁证明的
+  是另一个程序——Miri 下才存在的代码永不进生产，Miri 下消失的代码藏起待证路径。
+
+Miri 比原生慢一个数量级以上，所以只喂纯核心，不喂 `exec`/`process_identity`/`transport`/`session`
+（它们是薄壳，由集成测试与真机验收负责）。
+
 ## 其他约定
 
 - 分支：`main`；提交信息遵循 conventional commits（见 `git log` 历史风格）。

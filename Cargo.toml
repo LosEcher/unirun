@@ -15,8 +15,10 @@ categories = ["command-line-utilities", "development-tools"]
 # lying around) reaches the published payload. Everything excluded here is
 # fleet-internal — a cross-repo execution audit, agent instructions, the fleet
 # profile scripts, CI config — and none of it is needed to build or use the
-# crate. `scripts/bench.sh` stays: the README points at it.
-exclude = ["docs/", "scripts/apply-build-profile.sh", "scripts/clean-build-artifacts.sh", "AGENTS.md", ".github/"]
+# crate. `scripts/bench.sh` stays: the README points at it. `scripts/miri-pure-core.sh`
+# is excluded because it is a development gate — it probes ~/.cargo and a Miri
+# sysroot and asserts this repo's own test floor, so a consumer has no use for it.
+exclude = ["docs/", "scripts/apply-build-profile.sh", "scripts/clean-build-artifacts.sh", "scripts/miri-pure-core.sh", "AGENTS.md", ".github/"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -57,9 +57,9 @@ jobs:
         run: |
           set -euo pipefail
           cargo package --list --allow-dirty > /tmp/pkg-list.txt
-          if grep -Eq '^(docs/|scripts/apply-build-profile\.sh|scripts/clean-build-artifacts\.sh|AGENTS\.md|\.github/)' /tmp/pkg-list.txt; then
+          if grep -Eq '^(docs/|scripts/apply-build-profile\.sh|scripts/clean-build-artifacts\.sh|scripts/miri-pure-core\.sh|AGENTS\.md|\.github/)' /tmp/pkg-list.txt; then
             echo "::error::internal files must not ship in the .crate:"
-            grep -E '^(docs/|scripts/apply-build-profile\.sh|scripts/clean-build-artifacts\.sh|AGENTS\.md|\.github/)' /tmp/pkg-list.txt
+            grep -E '^(docs/|scripts/apply-build-profile\.sh|scripts/clean-build-artifacts\.sh|scripts/miri-pure-core\.sh|AGENTS\.md|\.github/)' /tmp/pkg-list.txt
             exit 1
           fi
           echo "packaged $(wc -l < /tmp/pkg-list.txt) files"
@@ -85,6 +85,38 @@ jobs:
           rustc +1.88.0 -V
           cargo +1.88.0 -V
           cargo +1.88.0 check --all-targets
+
+  # Miri under Tree Borrows, restricted to the syscall-free pure core
+  # (`encoding`, `coalesce`, `taxonomy`). Miri cannot execute FFI or real
+  # syscalls, so `exec`/`process_identity`/`transport`/`session` are out of
+  # scope by construction — the point of the split is a small core a machine
+  # can prove plus a thin shell only integration tests can judge.
+  #
+  # `--self-test` runs first on purpose: it injects deliberate UB into throwaway
+  # crates and requires Miri to report it. A Miri that cannot go red proves
+  # nothing about the crate.
+  #
+  # Nightly is required by Miri itself; it is NOT the crate's toolchain (that
+  # stays pinned to 1.97.0 in rust-toolchain.toml for every other job).
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + Miri
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri --component rust-src
+          cargo +nightly miri --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep Miri's own build artifacts separate from the default-profile
+          # ones; they never overlap and sharing the key evicts both faster.
+          workspaces: ". -> target"
+          key: miri
+          cache-on-failure: true
+      - name: Gate self-test (negative controls)
+        run: bash scripts/miri-pure-core.sh --self-test
+      - name: Miri pure core (Tree Borrows)
+        run: bash scripts/miri-pure-core.sh
 
   # Release assets follow a fixed `unirun-<os>-<arch>` naming contract so
   # consumers (Dockerfiles, install scripts, agent toolchains) can resolve the
