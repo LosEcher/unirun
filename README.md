@@ -134,6 +134,7 @@ cd unirun && cargo build --release
 ```bash
 unirun run '<command>' [--timeout 30] [--shell bash] [--workdir dir] [--env K=V] [--max-output N] [--output-encoding NAME] [--no-coalesce]
 unirun script path/to/script [options]     # shell inferred from extension
+unirun lint '<command>' | --stdin | --file P [--json]   # risky-heredoc judgement, runs nothing
 unirun probe [--json]                      # host capability snapshot
 unirun capabilities [--json]               # what this build can do (for consumers)
 unirun mcp                                 # serve MCP over stdio (agents)
@@ -149,6 +150,42 @@ unknown `--flag` is a **usage error (exit 2)** — it is never appended to the
 command or to the remote script. Use `--` when an argument to the command
 starts with a dash (`unirun run 'echo' --json -- --not-a-flag`); single-dash
 tokens like `-la` are positional, since they belong to the command.
+
+### Heredoc guard: content must not cross a parser
+
+A heredoc is the one place a shell accepts payload inline, and every way it can
+go wrong is silent — the command still exits 0. `unirun run|ssh|winrm` and the
+MCP `exec.run` / `exec.script` tools therefore scan the command text **before
+spawning**, and refuse four shapes:
+
+| shape | what actually happens |
+|---|---|
+| `<<EOF` (unquoted) with `$VAR`, `` `cmd` `` or `\` in the body | expanded before the payload is written |
+| the delimiter also appears as a line after the heredoc | the body closed early; the rest ran as commands |
+| a heredoc inside `$( … )`, `"…"` or backticks | the outer quote scan is ambiguous |
+| `printf … \| python3 - <<'PY'` | the heredoc replaces stdin, so the piped data is discarded |
+
+Exit codes: refused-call = 2 with nothing dispatched (`dispatched: false` and
+`error_class: "HEREDOC_RISK"` in `--json`). A quoted heredoc with a unique
+delimiter is the correct spelling and is never flagged. Modes:
+
+```bash
+unirun run '<cmd>'              # deny (default)
+unirun run '<cmd>' --heredoc=warn    # print the finding, run anyway
+unirun run '<cmd>' --heredoc=allow   # skip the scan (env: UNIRUN_HEREDOC=)
+unirun lint '<cmd>'             # 0 clean · 1 risky · 2 cannot judge — runs nothing
+cat script.sh | unirun lint --stdin     # for agent hooks
+unirun lint --file deploy/x.sh --file .github/workflows/ci.yml
+```
+
+There is deliberately no rewrite mode: quoting a delimiter changes semantics
+whenever the body really wants `$VAR`, and a guard that silently rewrites that
+would be the same bug it is meant to prevent. The finding carries the
+substitution instead (`write the payload to a file`, `<<'UNIQUE_DELIM'`).
+
+The judgement is one pure function (`src/heredoc.rs`), so a host hook, a CI step
+and the CLI all gate on the *same* rule. Hooks pipe the command they are about
+to run into `unirun lint --stdin`; nothing in the agent changes.
 
 ### Consumers: ask what the build can do, don't parse a version
 

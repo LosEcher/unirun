@@ -54,7 +54,7 @@ cargo fmt --check                       # 红 = scope 外有债：整文件 carg
 
 ## 改「纯核心」后：Miri 门禁（必须）
 
-`encoding` / `coalesce` / `taxonomy` 是无系统调用、无时钟、无文件系统的纯数据变换，
+`encoding` / `coalesce` / `taxonomy` / `heredoc` 是无系统调用、无时钟、无文件系统的纯数据变换，
 因此是**唯一能被机器证明**的部分（Miri 过不了 FFI 与真实 syscall）。改动它们后跑：
 
 ```sh
@@ -65,7 +65,7 @@ bash scripts/miri-pure-core.sh --self-test  # 门禁自检：注入 UB 必须报
 三条不可让步的语义：
 
 - **`2` 不是通过**。找不到 Miri / 没有 sysroot / 输出无法解析一律 `2`，调用方不得当绿。
-- **测试数下限（`MIRI_MIN_PASSED`，当前 34）是判据的一部分**。filter 匹配不到测试时的
+- **测试数下限（`MIRI_MIN_PASSED`，当前 45）是判据的一部分**。filter 匹配不到测试时的
   "0 passed" 与"真的都过了"必须可区分；新增纯核心测试后同步抬高下限。
 - **禁止 `#[cfg(miri)]` 分支**（门禁会 grep 并在命中时直接失败）：它会让门禁证明的
   是另一个程序——Miri 下才存在的代码永不进生产，Miri 下消失的代码藏起待证路径。

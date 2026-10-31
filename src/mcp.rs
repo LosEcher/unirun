@@ -365,6 +365,9 @@ fn call_tool(name: &str, args: &Value, cancel: &AtomicBool) -> (String, bool) {
                     true,
                 );
             }
+            if let Some(err) = heredoc_refusal(&command) {
+                return (err, true);
+            }
             unirun_run_cancellable(
                 &ExecSpec {
                     command,
@@ -384,6 +387,9 @@ fn call_tool(name: &str, args: &Value, cancel: &AtomicBool) -> (String, bool) {
                     json_error("exec.script: missing required argument `script`"),
                     true,
                 );
+            }
+            if let Some(err) = heredoc_refusal(&script) {
+                return (err, true);
             }
             let spec = ExecSpec {
                 command: script,
@@ -579,6 +585,33 @@ fn tool_result(result: ExecResult) -> (String, bool) {
 fn json_error(msg: &str) -> String {
     serde_json::to_string(&json!({ "error": msg }))
         .unwrap_or_else(|_| format!("{{\"error\":\"{}\"}}", msg))
+}
+
+/// Refuse a tool call that carries a provably risky inline heredoc.
+///
+/// MCP has no per-call flag, so the mode comes from `UNIRUN_HEREDOC`
+/// (`deny` default, `warn` prints to stderr and runs, `allow` skips the scan).
+/// The refusal is an `isError` tool result — the agent sees the finding and can
+/// retry with a file-based payload, which is the whole point.
+fn heredoc_refusal(text: &str) -> Option<String> {
+    use crate::heredoc::GuardMode;
+    let mode = GuardMode::from_env(GuardMode::Deny);
+    if mode != GuardMode::Deny {
+        return None;
+    }
+    let findings = crate::heredoc::scan(text);
+    if findings.is_empty() {
+        return None;
+    }
+    let rendered = findings
+        .iter()
+        .map(|f| f.render())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(json_error(&format!(
+        "refused before spawn: risky heredoc shape(s)\n{rendered}\n\
+         Write the payload to a file and run it by path, or set UNIRUN_HEREDOC=allow to run anyway."
+    )))
 }
 
 #[allow(dead_code)]

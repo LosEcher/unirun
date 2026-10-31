@@ -4,6 +4,28 @@ Release notes for `unirun`. The crate version, the git tag and the crates.io
 version are asserted to agree before a release is created (see CI's publish job),
 so a version listed here is a version that shipped.
 
+## Unreleased
+
+### Added
+
+- **`unirun lint`** — reports the four provably risky inline-heredoc shapes
+  (unquoted delimiter with expansion in the body, a delimiter reused after the
+  heredoc closed, a heredoc nested in `$( … )` / `"…"`, a pipe feeding stdin to
+  `python3 - <<'PY'`) without running anything. Exit codes follow the toolset:
+  `0` clean · `1` risky · `2` cannot judge. Inputs: a positional command,
+  `--stdin` (for agent hooks), or `--file` (repeatable, for CI).
+- **Heredoc guard on every execution surface** — `run` / `ssh` / `winrm` and the
+  MCP `exec.run` / `exec.script` tools scan before spawn and refuse by default
+  (`--heredoc=deny|warn|allow`, `UNIRUN_HEREDOC` for MCP). A refusal exits 2
+  with `dispatched: false` and `error_class: "HEREDOC_RISK"`; nothing ran.
+- Capability key `heredoc-guard`.
+
+### Notes
+
+- No rewrite mode. Quoting an unquoted delimiter changes semantics whenever the
+  body really wants `$VAR`; the finding carries the substitution instead, and a
+  guard that guessed would reproduce the bug it exists to stop.
+
 ## 0.5.0
 
 The release that closed the cross-project audit's P5 plan

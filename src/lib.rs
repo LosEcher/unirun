@@ -17,7 +17,9 @@
 //! - [`transport`]: [`SshTarget`], [`transport::ssh_run`],
 //!   [`transport::ssh_run_detached`], [`DetachedRun`];
 //! - [`probe::probe`], [`capabilities`], [`session`], [`recipe`],
-//!   [`taxonomy`] (the `error_class` vocabulary), [`encoding`].
+//!   [`taxonomy`] (the `error_class` vocabulary), [`encoding`],
+//!   [`heredoc::scan`] (the risky-heredoc judgement, shared by `lint` and the
+//!   pre-spawn guard).
 //!
 //! Everything else is internal and may change in a minor release. The CLI's
 //! `--json` payload and the library types are the **same** data: a parity test
@@ -33,6 +35,7 @@ pub mod coalesce;
 pub mod encoding;
 pub mod error_maps;
 pub mod exec;
+pub mod heredoc;
 pub mod mcp;
 pub mod probe;
 pub mod process_identity;

@@ -55,6 +55,7 @@ pub const FEATURE_KEYS: &[&str] = &[
     "legacy-codepage",      // GBK auto-detection
     "encoding-hint",        // --output-encoding / recipe [conventions] encoding
     "strict-flags",         // unknown `--flags` are a usage error, never script text
+    "heredoc-guard",        // --heredoc deny|warn|allow + `lint`; refuses risky inline heredocs
 ];
 
 #[derive(Debug, Serialize)]

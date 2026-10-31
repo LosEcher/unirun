@@ -5,6 +5,7 @@
 //!   timed out       → 124 (GNU timeout convention)
 //!   aborted         → 130 (SIGINT convention)
 //!   usage error     → 2
+//!   refused by the heredoc guard → 2 (nothing ran; `--heredoc=allow` overrides)
 //!   internal error  → 1
 //! In `--json` mode the process exits 0 whenever unirun itself ran; the full
 //! normalized result (including `exit_code`/`error_class`) is in the JSON.
@@ -13,6 +14,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use unirun::coalesce::CoalescePolicy;
 use unirun::exec::install_sigint_handler;
+use unirun::heredoc::{Finding, GuardMode};
 use unirun::recipe::Recipe;
 use unirun::spec::{ExecKind, ExecResult, ExecSpec, Shell};
 
@@ -22,6 +24,9 @@ unirun — cross-platform command execution normalization for AI agents
 USAGE:
   unirun run '<command>' [options]      run a command through a shell
   unirun script <file> [options]        run a script file (shell by extension)
+  unirun lint '<command>' | --stdin | --file <path> [--json]
+                                        report risky heredoc shapes; exit 0 clean,
+                                        1 risky, 2 cannot judge (runs nothing)
   unirun probe [--json]                 show host capabilities
   unirun capabilities [--json]          show what this build can do (versions →
                                         capability keys; for consumers)
@@ -46,6 +51,12 @@ OPTIONS:
                      code page for captured output: utf-8 | gbk | big5 | cp437 |
                       cp850 | windows-1252 (default: auto-detect)
   --toolchain <name> run via a recipe toolchain runner (e.g. python -> uv run)
+  --heredoc <mode>   deny | warn | allow (default deny). Before a command reaches
+                      the shell, refuse provably risky inline heredocs: unquoted
+                      delimiter with expansion in the body, a delimiter reused
+                      after the heredoc closed, a heredoc nested in $( ) / \"…\",
+                      or a pipe feeding stdin to `python3 - <<'PY'`. Skips
+                      nothing when the shape is safe (quoted + unique delimiter).
   --no-coalesce       disable output coalescing (streamed stdout is forwarded
                       in raw chunks instead of merged batches)
   --user <name>      SSH user for `unirun ssh` (user@host)
@@ -85,6 +96,7 @@ fn main() -> ExitCode {
     match sub {
         "run" => cmd_run(&args[1..]),
         "script" => cmd_script(&args[1..]),
+        "lint" => cmd_lint(&args[1..]),
         "probe" => cmd_probe(&args[1..]),
         "capabilities" => cmd_capabilities(&args[1..]),
         "ssh" => cmd_ssh(&args[1..]),
@@ -150,6 +162,8 @@ struct CliOpts {
     /// `utf-8` to switch the auto GBK fallback off.
     output_encoding: Option<String>,
     no_coalesce: bool,
+    /// How to treat a risky inline heredoc in the command/script text.
+    heredoc: GuardMode,
     json: bool,
     pretty: bool,
     /// SSH-only: `unirun ssh` identity options.
@@ -240,6 +254,13 @@ fn parse_flags(raw_args: &[String], opts: &mut CliOpts) -> Result<Vec<String>, S
                 opts.toolchain = Some(v.clone());
             }
             "--no-coalesce" => opts.no_coalesce = true,
+            "--heredoc" => {
+                i += 1;
+                let v = args.get(i).ok_or("--heredoc needs deny | warn | allow")?;
+                opts.heredoc = GuardMode::parse(v).ok_or_else(|| {
+                    format!("unknown --heredoc mode `{}` (deny | warn | allow)", v)
+                })?;
+            }
             "--detach" => opts.detach = true,
             "--user" => {
                 i += 1;
@@ -372,7 +393,156 @@ fn build_spec(command: String, kind: ExecKind, opts: &CliOpts) -> ExecSpec {
     spec
 }
 
-/// Resolve a recipe toolchain to a direct argv (`runner args… <file>`).
+/// Refuse (or warn about) a command/script string carrying a provably risky
+/// inline heredoc. `Some(exit code)` means "do not run this".
+fn heredoc_gate(script: &str, opts: &CliOpts, subject: &str) -> Option<ExitCode> {
+    if opts.heredoc == GuardMode::Allow {
+        return None;
+    }
+    let findings = unirun::heredoc::scan(script);
+    if findings.is_empty() {
+        return None;
+    }
+    let rendered = findings
+        .iter()
+        .map(Finding::render)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if opts.heredoc == GuardMode::Warn {
+        eprintln!("unirun: warning: risky heredoc shape(s) in the {subject}; running anyway");
+        eprintln!("{rendered}");
+        return None;
+    }
+    eprintln!("unirun: refusing to run the {subject}: risky heredoc shape(s)");
+    eprintln!("{rendered}");
+    eprintln!("  why: these shapes fail silently (expanded variables, early-closed body, discarded stdin) and still exit 0");
+    eprintln!("  escape hatch: --heredoc=allow; check without running: unirun lint '<command>'");
+    if opts.json || opts.pretty {
+        let refusal = serde_json::json!({
+            "exit_code": serde_json::Value::Null,
+            "signal": serde_json::Value::Null,
+            "stdout": "",
+            "stderr": rendered,
+            "timed_out": false,
+            "aborted": false,
+            "duration_ms": 0,
+            "error_class": "HEREDOC_RISK",
+            "hint": "nothing ran: the command was refused before spawn. Remove the inline heredoc (write the payload to a file) or pass --heredoc=allow",
+            "encoding": "utf-8",
+            "truncated": false,
+            "shell_used": "-",
+            "transport_error": false,
+            "transport_stderr": serde_json::Value::Null,
+            "dispatched": false,
+            "kill_status": serde_json::Value::Null,
+            "exit_code_confidence": "unknown",
+            "drain_timeout": false
+        });
+        println!("{}", serde_json::to_string(&refusal).unwrap_or_default());
+    }
+    Some(ExitCode::from(2))
+}
+
+/// `unirun lint '<command>' | --file <path>…` — the judgement without execution.
+///
+/// Exit codes match the rest of the toolset: 0 clean · 1 risky · 2 cannot judge
+/// (unreadable file / usage error), so a CI step can gate on it.
+fn cmd_lint(args: &[String]) -> ExitCode {
+    let mut json = false;
+    let mut stdin_mode = false;
+    let mut files: Vec<String> = Vec::new();
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" | "--pretty" => json = true,
+            // For hooks: an agent host pipes the command it is about to run.
+            "--stdin" => stdin_mode = true,
+            "--file" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => files.push(v.clone()),
+                    None => {
+                        eprintln!("unirun lint: --file needs a path");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--" => {
+                positional.extend_from_slice(&args[i + 1..]);
+                break;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unirun lint: unknown flag `{}`", other);
+                return ExitCode::from(2);
+            }
+            other => positional.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let mut sources: Vec<(String, Vec<Finding>)> = Vec::new();
+    if !positional.is_empty() {
+        let command = positional.join(" ");
+        sources.push(("<command>".to_string(), unirun::heredoc::scan(&command)));
+    }
+    if stdin_mode {
+        use std::io::Read;
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            eprintln!("unirun lint: cannot read stdin: {}", e);
+            return ExitCode::from(2);
+        }
+        sources.push(("<stdin>".to_string(), unirun::heredoc::scan(&buf)));
+    }
+    for path in &files {
+        match std::fs::read_to_string(path) {
+            Ok(content) => sources.push((path.clone(), unirun::heredoc::scan(&content))),
+            Err(e) => {
+                eprintln!("unirun lint: cannot read `{}`: {}", path, e);
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if sources.is_empty() {
+        eprintln!("unirun lint: usage: unirun lint '<command>' | --stdin | --file <path> [--json]");
+        return ExitCode::from(2);
+    }
+
+    let risky = sources.iter().any(|(_, f)| !f.is_empty());
+    if json {
+        let payload = sources
+            .iter()
+            .map(|(source, findings)| {
+                serde_json::json!({
+                    "source": source,
+                    "verdict": if findings.is_empty() { "clean" } else { "risky" },
+                    "findings": findings,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({ "sources": payload })).unwrap_or_default()
+        );
+    } else {
+        for (source, findings) in &sources {
+            if findings.is_empty() {
+                println!("{}: clean", source);
+                continue;
+            }
+            for f in findings {
+                println!("{}: {}", source, f.render());
+            }
+        }
+    }
+    if risky {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 fn toolchain_argv(recipe: &Recipe, name: &str, file: &str) -> Result<Vec<String>, String> {
     recipe
         .resolve_toolchain(name)
@@ -435,6 +605,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let command = positional.join(" ");
+    if let Some(code) = heredoc_gate(&command, &opts, "command") {
+        return code;
+    }
     let spec = build_spec(command, ExecKind::Run, &opts);
     let result = unirun::run(&spec);
     emit(&result, &opts, opts.pretty)
@@ -518,6 +691,9 @@ fn cmd_ssh(args: &[String]) -> ExitCode {
         target.timeout_ms = t * 1000;
     }
     let script = positional[1..].join(" ");
+    if let Some(code) = heredoc_gate(&script, &opts, "remote script") {
+        return code;
+    }
     if opts.detach {
         return cmd_ssh_detach(&script, &target, &opts);
     }
@@ -1152,6 +1328,15 @@ fn cmd_winrm(args: &[String]) -> ExitCode {
     }
     target.host = positional[0].clone();
     let script = positional[1..].join(" ");
+    let gate_opts = CliOpts {
+        heredoc: GuardMode::from_env(GuardMode::Deny),
+        json,
+        pretty,
+        ..Default::default()
+    };
+    if let Some(code) = heredoc_gate(&script, &gate_opts, "remote script") {
+        return code;
+    }
     if let Some(t) = timeout_sec {
         target.timeout_ms = t * 1000;
     }
